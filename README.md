@@ -14,7 +14,6 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 - Confirmation dialog before every switch; cancelling writes nothing.
 - Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
 - Per-agent editor behind the preset-editing setting: ordered fallback chain with a variant per entry, `inheritModelFrom`, temperature, skills/skills_add/skills_remove, MCPs, permission, display name and color — written to the preset or to the root `agents` map, in either layer.
-- Emergency stop for running subagents, matching the plugin's `/killall` (aborts them and leaves the orchestrator a stop notice).
 - Checks configured models against the effective model catalog and marks missing ones in red.
 - Tracks active and recently finished sessions per agent, with live runtime display.
 - Effective after a Managed Service restart (Settings → Apply & Restart).
