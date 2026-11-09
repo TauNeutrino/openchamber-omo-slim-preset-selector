@@ -528,6 +528,31 @@
         background: var(--oc-hover, rgba(127, 127, 127, 0.15));
       }
 
+      /* Emergency stop: one destructive line under the active row. */
+      .stop-running {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        width: 100%;
+        padding: 4px 8px;
+        border: 1px solid color-mix(in srgb, var(--oc-destructive, #f38ba8) 45%, transparent);
+        border-radius: calc(var(--oc-radius, 8px) * 0.7);
+        background: color-mix(in srgb, var(--oc-destructive, #f38ba8) 12%, transparent);
+        color: var(--oc-destructive, #f38ba8);
+        font-size: 11px;
+        font-weight: 500;
+        text-align: left;
+        cursor: pointer;
+      }
+      .stop-running:hover {
+        background: color-mix(in srgb, var(--oc-destructive, #f38ba8) 20%, transparent);
+      }
+      .stop-running-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       /* Confirm card: segmented scope switch, notes and override warning. */
       .confirm-scope {
         display: flex;

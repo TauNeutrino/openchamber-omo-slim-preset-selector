@@ -25,7 +25,7 @@ import {
   type PresetSwitchScope,
   type PresetView,
 } from './config.ts';
-import { countGlyph, groupAgentSessions, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
+import { countGlyph, groupAgentSessions, rootSessionId, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
 import { setLocale, t } from './i18n.ts';
 import { auditModelRefs, collectModelRefs, type ModelAudit } from './model-audit.ts';
 
@@ -62,6 +62,7 @@ type Interaction =
   | { kind: 'confirm'; name: string; scope: PresetSwitchScope; clearProjectOverride: boolean }
   | { kind: 'applying'; name: string; scope: PresetSwitchScope }
   | { kind: 'busy' }
+  | { kind: 'confirm-kill'; count: number; sessionIds: string[]; parents: string[] }
   | { kind: 'confirm-model-switch'; sessionId: string; model: string; presetName: string };
 
 type LayersRead =
@@ -754,6 +755,59 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
   activeRow.append(gear);
   panel.append(activeRow);
 
+  // Emergency stop, like the plugin's /killall: abort every running subagent of
+  // this session and let the orchestrator see a stop notice on its next turn.
+  const running = [...agentSessions.values()].flatMap((group) => group.active);
+  if (interaction.kind === 'confirm-kill') {
+    const count = interaction.count;
+    const card = element('div', 'confirm');
+    card.tabIndex = -1;
+    card.setAttribute('role', 'group');
+    card.setAttribute('aria-label', t('stopSubagentsTitle', count));
+    card.append(element('div', 'confirm-title', t('stopSubagentsTitle', count)));
+    card.append(element('div', 'confirm-body', t('stopSubagentsBody', count)));
+    const actions = element('div', 'confirm-actions');
+    mounted.push(mountButton(actions, {
+      label: t('cancel'),
+      variant: 'ghost',
+      size: 'sm',
+      disabled: busy,
+      onClick: () => {
+        interaction = { kind: 'browse' };
+        paint();
+      },
+    }));
+    mounted.push(mountButton(actions, {
+      label: t('stopSubagentsConfirm'),
+      variant: 'destructive',
+      size: 'sm',
+      loading: busy,
+      onClick: () => {
+        const { sessionIds, parents } = interaction as Extract<Interaction, { kind: 'confirm-kill' }>;
+        void stopSubagents(sessionIds, parents);
+      },
+    }));
+    card.append(actions);
+    panel.append(card);
+  } else if (running.length > 0 && !busy) {
+    const stop = element('button', 'stop-running');
+    stop.type = 'button';
+    stop.append(element('span', 'stop-running-label', t('stopSubagents', running.length)));
+    stop.addEventListener('click', () => {
+      const parent = lastSessionSnapshot
+        ? rootSessionId(lastSessionSnapshot.sessionId, lastSessionSnapshot.records)
+        : currentSessionId;
+      interaction = {
+        kind: 'confirm-kill',
+        count: running.length,
+        sessionIds: running.map((session) => session.id),
+        parents: parent ? [parent] : [],
+      };
+      paint();
+    });
+    panel.append(stop);
+  }
+
   if (settingsOpen) {
     const box = element('div', 'settings-box');
     const row = element('div', 'setting-row');
@@ -1314,6 +1368,49 @@ const clearProjectOverride = async (): Promise<void> => {
     notice = { tone: 'error', title: t('presetNotChanged'), body: errorText(error) };
     paint();
     autoDismissNotice(5000);
+  }
+};
+
+/**
+ * Aborts the running subagents of this session and drops the plugin's stop
+ * record, so the orchestrator's next turn carries the emergency-stop notice.
+ */
+const stopSubagents = async (sessionIds: string[], parents: string[]): Promise<void> => {
+  if (!directory) return;
+  interaction = { kind: 'busy' };
+  notice = null;
+  paint();
+  try {
+    const result = await host.serviceRequest({
+      method: 'POST',
+      path: '/kill-sessions',
+      body: JSON.stringify({ sessionIds, parents, directory }),
+    });
+    if (result.status !== 200) throw new Error(t('serviceHttpError', result.status));
+    const answer = JSON.parse(result.body) as { ok?: boolean; aborted?: number; failed?: number; error?: string };
+    if (!answer.ok) throw new Error(answer.error ?? t('stopFailed'));
+    const aborted = answer.aborted ?? 0;
+    const failed = answer.failed ?? 0;
+    interaction = { kind: 'browse' };
+    notice = {
+      tone: failed > 0 ? 'warning' : 'success',
+      title: t('subagentsStopped', aborted),
+      body: failed > 0 ? t('subagentsStopPartial', failed) : undefined,
+    };
+    paint();
+    autoDismissNotice(6000);
+    void host.toast({ kind: 'success', message: t('subagentsStopped', aborted) });
+  } catch (error) {
+    interaction = { kind: 'browse' };
+    const unavailable = error instanceof HostRequestError
+      && (error.code === 'NOT_GRANTED' || error.code === 'NO_SERVICE');
+    notice = {
+      tone: 'error',
+      title: t('stopFailed'),
+      body: unavailable ? t('stopUnavailable') : errorText(error),
+    };
+    paint();
+    autoDismissNotice(6000);
   }
 };
 
