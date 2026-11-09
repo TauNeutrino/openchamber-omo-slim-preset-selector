@@ -246,6 +246,17 @@
         font: 10px/1.6 var(--oc-mono, ui-monospace, monospace);
         white-space: nowrap;
       }
+      /* Number of models the agent falls back to; dashed to read as a count,
+         not as another model id. */
+      .variant.fallback-count {
+        padding: 0 4px;
+        border-style: dashed;
+        font-size: 9px;
+      }
+      .model-content.is-inherited {
+        color: var(--oc-muted, #999);
+        font-style: italic;
+      }
       .agent-disclosure {
         display: inline-flex;
         align-items: center;
@@ -477,6 +488,6 @@
   </head>
   <body>
     <div id="root"></div>
-    <script src="main.js?v=1.5.16"></script>
+    <script src="main.js?v=1.5.17"></script>
   </body>
 </html>

@@ -60,11 +60,11 @@ test('parses the global .json shape with variants', () => {
   assert.equal(parsed.config.hasPresets, true);
   assert.deepEqual(parsed.config.presets['opencode-go'][0], {
     agent: 'orchestrator',
-    model: 'opencode-go/glm-5.3-flash',
+    models: [{ model: 'opencode-go/glm-5.3-flash' }],
     variant: 'high',
   });
   assert.deepEqual(parsed.config.presets.free, [
-    { agent: 'orchestrator', model: 'opencode/glm-5.3-flash-free' },
+    { agent: 'orchestrator', models: [{ model: 'opencode/glm-5.3-flash-free' }] },
   ]);
 });
 
@@ -247,8 +247,57 @@ test('reads a preset that wraps its agent map in an agents key', () => {
   if (!result.ok) return;
   assert.deepEqual(result.view.active, { name: 'nested', origin: 'global' });
   assert.deepEqual(result.view.agents, [
-    { agent: 'orchestrator', model: 'github-copilot/gpt-6-luna-275k', variant: 'high' },
-    { agent: 'oracle', model: 'github-copilot/gpt-6.1-sol' },
+    { agent: 'orchestrator', models: [{ model: 'github-copilot/gpt-6-luna-275k' }], variant: 'high' },
+    { agent: 'oracle', models: [{ model: 'github-copilot/gpt-6.1-sol' }] },
+  ]);
+});
+
+test('reads fallback chains and per-entry variants', () => {
+  const raw = `{
+    "preset": "chain",
+    "presets": {
+      "chain": {
+        "agents": {
+          "oracle": {
+            "model": [{ "id": "magpie/agy-cli/gemini-4-argon", "variant": "high" }, "magpie/grok/grok-4.6", { "id": "opencode-go/glm-5.3" }],
+            "skills": ["simplify"]
+          },
+          "fixer": { "model": "opencode-go/deepseek-v4.1-flash" },
+          "helper": { "inheritModelFrom": "orchestrator" }
+        },
+        "marketplace": { "agents": ["alvin/validator"] }
+      }
+    }
+  }`;
+  const result = resolvePresetView(layer('global', GLOBAL, raw), null);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.view.agents, [
+    { agent: 'oracle', models: [
+      { model: 'magpie/agy-cli/gemini-4-argon', variant: 'high' },
+      { model: 'magpie/grok/grok-4.6' },
+      { model: 'opencode-go/glm-5.3' },
+    ] },
+    { agent: 'fixer', models: [{ model: 'opencode-go/deepseek-v4.1-flash' }] },
+    { agent: 'helper', models: [], inheritModelFrom: 'orchestrator' },
+  ]);
+});
+
+test('does not surface the marketplace block of a flat preset as an agent', () => {
+  const raw = `{
+    "preset": "flat",
+    "presets": {
+      "flat": {
+        "marketplace": { "agents": ["alvin/validator"] },
+        "orchestrator": { "model": "opencode-go/glm-5.3" }
+      }
+    }
+  }`;
+  const result = resolvePresetView(layer('global', GLOBAL, raw), null);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.view.agents, [
+    { agent: 'orchestrator', models: [{ model: 'opencode-go/glm-5.3' }] },
   ]);
 });
 
@@ -261,7 +310,7 @@ test('the project override wins and writes to the project file', () => {
   if (!result.ok) return;
   assert.deepEqual(result.view.active, { name: 'free', origin: 'project' });
   assert.deepEqual(result.view.agents, [
-    { agent: 'orchestrator', model: 'opencode/glm-5.3-flash-free' },
+    { agent: 'orchestrator', models: [{ model: 'opencode/glm-5.3-flash-free' }] },
   ]);
   const target = resolveWriteTarget(global, project);
   assert.equal(target.kind, 'project');
@@ -309,4 +358,12 @@ test('sorted names and the orchestrator hint', () => {
   assert.deepEqual(sortedPresetNames(parsed.config.presets), ['free', 'opencode-go']);
   assert.equal(orchestratorModel(parsed.config.presets, 'opencode-go'), 'opencode-go/glm-5.3-flash');
   assert.equal(orchestratorModel(parsed.config.presets, 'missing'), null);
+});
+
+test('the orchestrator hint uses the primary model of a chain', () => {
+  const raw = '{ "presets": { "p": { "agents": { "orchestrator": { "model": ["a/b", "c/d"] } } } } }';
+  const parsed = parseConfigText(raw, GLOBAL);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(orchestratorModel(parsed.config.presets, 'p'), 'a/b');
 });

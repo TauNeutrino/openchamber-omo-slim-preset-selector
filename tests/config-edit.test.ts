@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { addPresetToText, applyAgentModelToText } from '../src/config.ts';
+import { addPresetToText, applyAgentModelToText, parseConfigText } from '../src/config.ts';
 
 const CONFIG = `{
   "preset": "default",
@@ -54,18 +54,78 @@ const CONFIG2 = `{
 }`;
 
 test('addPresetToText adds a new preset', () => {
-  const next = addPresetToText(CONFIG2, 'clone', [{ agent: 'orchestrator', model: 'openai/gpt-4o' }]);
+  const next = addPresetToText(CONFIG2, 'clone', [{ agent: 'orchestrator', models: [{ model: 'openai/gpt-4o' }] }]);
   assert.match(next, /"clone"/);
   assert.match(next, /"openai\/gpt-4o"/);
   assert.match(next, /"default"/);
 });
 
 test('addPresetToText refuses duplicate name', () => {
-  assert.throws(() => addPresetToText(CONFIG2, 'default', [{ agent: 'orchestrator', model: 'x/y' }]));
+  assert.throws(() => addPresetToText(CONFIG2, 'default', [{ agent: 'orchestrator', models: [{ model: 'x/y' }] }]));
 });
 
 test('addPresetToText works on empty file', () => {
-  const next = addPresetToText('', 'new', [{ agent: 'orchestrator', model: 'a/b' }]);
+  const next = addPresetToText('', 'new', [{ agent: 'orchestrator', models: [{ model: 'a/b' }] }]);
   assert.match(next, /"presets"/);
   assert.match(next, /"new"/);
+});
+
+test('addPresetToText keeps a model chain a chain', () => {
+  const next = addPresetToText(CONFIG2, 'chain', [{
+    agent: 'oracle',
+    models: [{ model: 'a/b', variant: 'high' }, { model: 'c/d' }, { model: 'e/f' }],
+  }]);
+  const parsed = parseConfigText(next, 'result');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.config.presets.chain, [{
+    agent: 'oracle',
+    models: [{ model: 'a/b', variant: 'high' }, { model: 'c/d' }, { model: 'e/f' }],
+  }]);
+});
+
+const CHAIN = `{
+  "preset": "chain",
+  "presets": {
+    "chain": {
+      "agents": {
+        "oracle": { "model": ["a/b", { "id": "c/d", "variant": "low" }], "variant": "high" }
+      }
+    }
+  }
+}`;
+
+test('applyAgentModelToText replaces the primary and keeps the fallbacks', () => {
+  const next = applyAgentModelToText(CHAIN, 'chain', 'oracle', 'e/f');
+  const parsed = parseConfigText(next, 'result');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.config.presets.chain, [{
+    agent: 'oracle',
+    models: [{ model: 'e/f' }, { model: 'a/b' }, { model: 'c/d', variant: 'low' }],
+    variant: 'high',
+  }]);
+});
+
+test('applyAgentModelToText writes the variant into the chain entry', () => {
+  const next = applyAgentModelToText(CHAIN, 'chain', 'oracle', 'e/f', 'max');
+  const parsed = parseConfigText(next, 'result');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.config.presets.chain, [{
+    agent: 'oracle',
+    models: [{ model: 'e/f', variant: 'max' }, { model: 'a/b' }, { model: 'c/d', variant: 'low' }],
+    variant: 'high',
+  }]);
+});
+
+test('applyAgentModelToText does not duplicate a model already in the chain', () => {
+  const next = applyAgentModelToText(CHAIN, 'chain', 'oracle', 'a/b');
+  const parsed = parseConfigText(next, 'result');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.config.presets.chain[0].models, [
+    { model: 'a/b' },
+    { model: 'c/d', variant: 'low' },
+  ]);
 });

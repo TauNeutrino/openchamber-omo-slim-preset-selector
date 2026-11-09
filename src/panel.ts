@@ -15,6 +15,8 @@ import {
   clearPresetFromText,
   orchestratorModel,
   parseConfigText,
+  primaryModel,
+  primaryVariant,
   resolvePresetView,
   resolveWriteTarget,
   sortedPresetNames,
@@ -253,7 +255,7 @@ const auditForReadyScreen = (): ModelAudit | null => (modelCheck.kind === 'done'
 const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetAgent) => void): HTMLElement => {
   const key = agent.agent;
   const name = agent.agent;
-  const missing = modelIsMissing(auditForReadyScreen(), agent.model);
+  const missing = modelIsMissing(auditForReadyScreen(), agent);
   const group = element('div', missing ? 'agent-group is-missing' : 'agent-group');
   const row = element('div', 'agent');
   const sessions = agentSessions.get(key)?.active ?? [];
@@ -286,21 +288,44 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
     value.addEventListener('click', () => onEdit(agent));
   }
   const model = element('span', 'model-text');
-  // Provider part dezent, Modell-ID betont — Split am letzten "/".
-  const slash = agent.model.lastIndexOf('/');
-  if (slash > 0) {
-    model.append(element('span', 'model-provider', agent.model.slice(0, slash + 1)));
-    model.append(element('span', 'model-content', agent.model.slice(slash + 1)));
+  const primary = primaryModel(agent);
+  if (primary) {
+    // Provider part dezent, Modell-ID betont — Split am letzten "/".
+    const slash = primary.lastIndexOf('/');
+    if (slash > 0) {
+      model.append(element('span', 'model-provider', primary.slice(0, slash + 1)));
+      model.append(element('span', 'model-content', primary.slice(slash + 1)));
+    } else {
+      model.append(element('span', 'model-content', primary));
+    }
   } else {
-    model.append(element('span', 'model-content', agent.model));
+    // The agent sets no model of its own: it inherits one, or the plugin's
+    // default applies. Say so instead of leaving the row blank.
+    const label = agent.inheritModelFrom ? t('inheritsFrom', agent.inheritModelFrom) : t('noModelSet');
+    model.append(element('span', 'model-content is-inherited', label));
   }
   value.append(model);
-  if (agent.variant) {
-    const variant = element('span', 'variant');
-    variant.append(element('span', 'model-content', agent.variant));
-    value.append(variant);
+  const fallbackCount = Math.max(agent.models.length - 1, 0);
+  if (fallbackCount > 0) {
+    const fallback = element('span', 'variant fallback-count', `+${fallbackCount}`);
+    fallback.title = t('fallbackModels', fallbackCount);
+    value.append(fallback);
   }
-  value.title = `${agent.agent} · ${agent.model}${agent.variant ? ` (${agent.variant})` : ''}`
+  const variant = primaryVariant(agent);
+  if (variant) {
+    const pill = element('span', 'variant');
+    pill.append(element('span', 'model-content', variant));
+    value.append(pill);
+  }
+  if (agent.inheritModelFrom && primary) {
+    const inherited = element('span', 'variant', `⇢ ${agent.inheritModelFrom}`);
+    inherited.title = t('inheritsFrom', agent.inheritModelFrom);
+    value.append(inherited);
+  }
+  const chain = agent.models
+    .map((ref) => (ref.variant ? `${ref.model} (${ref.variant})` : ref.model))
+    .join(' → ');
+  value.title = `${agent.agent} · ${chain || (agent.inheritModelFrom ? t('inheritsFrom', agent.inheritModelFrom) : t('noModelSet'))}`
     + (missing ? t('modelNotFoundInCatalog') : '');
   row.append(value);
   group.append(row);
@@ -487,8 +512,9 @@ const paintMissingModelsBanner = (panel: HTMLElement, audit: ModelAudit): void =
   }));
 };
 
-const modelIsMissing = (audit: ModelAudit | null, model: string): boolean => (
-  audit !== null && audit.checkedAt !== null && audit.missing.some((entry) => entry.ref === model)
+const modelIsMissing = (audit: ModelAudit | null, agent: PresetAgent): boolean => (
+  audit !== null && audit.checkedAt !== null
+  && agent.models.some((ref) => audit.missing.some((entry) => entry.ref === ref.model))
 );
 
 const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
@@ -999,8 +1025,8 @@ const openModelPicker = (agent: PresetAgent, model: ReadyModel): void => {
     agent: agent.agent,
     presetName: model.view.active.name,
     targetPath,
-    currentModel: agent.model,
-    currentVariant: agent.variant ?? '',
+    currentModel: primaryModel(agent) ?? '',
+    currentVariant: primaryVariant(agent),
   };
   pickerFilter = '';
   pickerAppliedFilter = '';

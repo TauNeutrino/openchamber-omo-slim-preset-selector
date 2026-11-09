@@ -18,11 +18,36 @@ import {
   type ParseError,
 } from 'jsonc-parser';
 
-export type PresetAgent = {
-  agent: string;
+/** One entry of a model fallback chain, as the schema allows it. */
+export type PresetModelRef = {
   model: string;
   variant?: string;
 };
+
+export type PresetAgent = {
+  agent: string;
+  /**
+   * The configured models in order: a plain string model becomes a one-entry
+   * chain, a `model` array a chain with the primary first. Empty when the block
+   * configures no model at all.
+   */
+  models: PresetModelRef[];
+  /** The agent-level `variant` key, which sits next to the whole model chain. */
+  variant?: string;
+  /** The agent takes its model from the session or the orchestrator instead. */
+  inheritModelFrom?: 'session' | 'orchestrator';
+};
+
+/** The model the agent actually runs on, or null when its block sets none. */
+export const primaryModel = (agent: PresetAgent): string | null => agent.models[0]?.model ?? null;
+
+/**
+ * The variant the primary model runs with. The agent-level key wins over the
+ * variant of the first chain entry, exactly like the plugin resolves it.
+ */
+export const primaryVariant = (agent: PresetAgent): string => (
+  agent.variant ?? agent.models[0]?.variant ?? ''
+);
 
 export type ParsedPresetConfig = {
   /** The `preset` key, trimmed; null when the file does not set one. */
@@ -87,6 +112,32 @@ const nonEmptyString = (value: unknown): string | null => {
   return trimmed.length > 0 ? trimmed : null;
 };
 
+/**
+ * Reads one agent's `model` value. The schema allows a plain string or an
+ * array of strings and `{ id, variant }` objects as a fallback chain.
+ */
+const modelRefsOf = (value: unknown): PresetModelRef[] => {
+  if (typeof value === 'string') {
+    const model = value.trim();
+    return model ? [{ model }] : [];
+  }
+  if (!Array.isArray(value)) return [];
+  const refs: PresetModelRef[] = [];
+  for (const entry of value) {
+    if (typeof entry === 'string') {
+      const model = entry.trim();
+      if (model) refs.push({ model });
+      continue;
+    }
+    if (!isPlainObject(entry)) continue;
+    const model = nonEmptyString(entry.id);
+    if (!model) continue;
+    const variant = nonEmptyString(entry.variant);
+    refs.push(variant ? { model, variant } : { model });
+  }
+  return refs;
+};
+
 const agentsOf = (block: unknown): PresetAgent[] => {
   if (!isPlainObject(block)) return [];
   // Newer slim configs wrap the agent map in an `agents` key (next to
@@ -95,10 +146,17 @@ const agentsOf = (block: unknown): PresetAgent[] => {
   const agents: PresetAgent[] = [];
   for (const [agent, value] of Object.entries(map)) {
     if (!isPlainObject(value)) continue;
-    const model = nonEmptyString(value.model);
-    if (!model) continue;
+    const models = modelRefsOf(value.model);
+    const inherits = nonEmptyString(value.inheritModelFrom);
+    const inheritModelFrom = inherits === 'session' || inherits === 'orchestrator' ? inherits : undefined;
+    // A block without a model reference is not an agent row: in the legacy
+    // flat form it would otherwise surface keys like `marketplace` as agents.
+    if (models.length === 0 && !inheritModelFrom) continue;
+    const entry: PresetAgent = { agent, models };
     const variant = nonEmptyString(value.variant);
-    agents.push(variant ? { agent, model, variant } : { agent, model });
+    if (variant) entry.variant = variant;
+    if (inheritModelFrom) entry.inheritModelFrom = inheritModelFrom;
+    agents.push(entry);
   }
   return agents;
 };
@@ -335,8 +393,10 @@ export const orchestratorModel = (
   name: string,
 ): string | null => {
   const agents = presets[name] ?? [];
-  const orchestrator = agents.find((agent) => agent.agent === 'orchestrator') ?? agents[0];
-  return orchestrator?.model ?? null;
+  const orchestrator = agents.find((agent) => agent.agent === 'orchestrator');
+  const chosen = (orchestrator && primaryModel(orchestrator) ? orchestrator : undefined)
+    ?? agents.find((agent) => primaryModel(agent) !== null);
+  return chosen ? primaryModel(chosen) : null;
 };
 
 export const sortedPresetNames = (presets: Record<string, PresetAgent[]>): string[] => (
@@ -371,9 +431,19 @@ export const addPresetToText = (
   const content = hasBom ? raw.slice(1) : raw;
   const fmt = formattingFor(content);
 
-  const agentObj: Record<string, { model: string; variant?: string }> = {};
+  const agentObj: Record<string, Record<string, unknown>> = {};
   for (const a of agents) {
-    agentObj[a.agent] = a.variant ? { model: a.model, variant: a.variant } : { model: a.model };
+    const block: Record<string, unknown> = {};
+    if (a.models.length > 0) {
+      // Keep a chain a chain; a single plain model stays a string like in the
+      // source preset.
+      block.model = a.models.length === 1 && !a.models[0].variant
+        ? a.models[0].model
+        : a.models.map((ref) => (ref.variant ? { id: ref.model, variant: ref.variant } : ref.model));
+    }
+    if (a.variant) block.variant = a.variant;
+    if (a.inheritModelFrom) block.inheritModelFrom = a.inheritModelFrom;
+    agentObj[a.agent] = block;
   }
 
   let next: string;
@@ -412,27 +482,41 @@ export const applyAgentModelToText = (
   const basePath = wrapped
     ? ['presets', presetName, 'agents', agentName]
     : ['presets', presetName, agentName];
-
-  const fmt = formattingFor(content);
-  let next = content;
-  const modelEdits = modify(next, [...basePath, 'model'], nextModel, { formattingOptions: fmt });
-  next = applyEdits(next, modelEdits);
-  const v = variant?.trim() ?? '';
   const agentBlock = wrapped
     ? (isPlainObject(block.agents) ? (block.agents as Record<string, unknown>)[agentName] : null)
     : (block as Record<string, unknown>)[agentName];
-  const hasVariant = isPlainObject(agentBlock) && Object.prototype.hasOwnProperty.call(agentBlock, 'variant');
-  if (v) {
-    const variantEdits = modify(next, [...basePath, 'variant'], v, { formattingOptions: fmt });
-    next = applyEdits(next, variantEdits);
-  } else if (hasVariant) {
-    const variantEdits = modify(next, [...basePath, 'variant'], undefined, { formattingOptions: fmt });
-    next = applyEdits(next, variantEdits);
+  const currentModel = isPlainObject(agentBlock) ? agentBlock.model : undefined;
+
+  const fmt = formattingFor(content);
+  const v = variant?.trim() ?? '';
+  let next = content;
+  if (Array.isArray(currentModel)) {
+    // A fallback chain: the picked model becomes the primary and the rest of
+    // the chain survives as fallbacks. The variant belongs to the entry, not
+    // to the agent, so the agent-level key stays untouched.
+    const entry = v ? { id: nextModel, variant: v } : nextModel;
+    const rest = currentModel.filter((item) => {
+      const id = typeof item === 'string' ? item.trim() : (isPlainObject(item) ? nonEmptyString(item.id) : null);
+      return id !== nextModel;
+    });
+    const modelEdits = modify(next, [...basePath, 'model'], [entry, ...rest], { formattingOptions: fmt });
+    next = applyEdits(next, modelEdits);
+  } else {
+    const modelEdits = modify(next, [...basePath, 'model'], nextModel, { formattingOptions: fmt });
+    next = applyEdits(next, modelEdits);
+    const hasVariant = isPlainObject(agentBlock) && Object.prototype.hasOwnProperty.call(agentBlock, 'variant');
+    if (v) {
+      const variantEdits = modify(next, [...basePath, 'variant'], v, { formattingOptions: fmt });
+      next = applyEdits(next, variantEdits);
+    } else if (hasVariant) {
+      const variantEdits = modify(next, [...basePath, 'variant'], undefined, { formattingOptions: fmt });
+      next = applyEdits(next, variantEdits);
+    }
   }
   const after = parseConfigText(next, t('resultLabel'));
   if (!after.ok) throw new Error(`Die Änderung würde die Konfiguration beschädigen: ${after.error}`);
   const agents = after.config.presets[presetName] ?? [];
   const changed = agents.find((a) => a.agent === agentName);
-  if (!changed || changed.model !== nextModel) throw new Error(t('changeNotVerified'));
+  if (!changed || primaryModel(changed) !== nextModel) throw new Error(t('changeNotVerified'));
   return hasBom ? `${BOM}${next}` : next;
 };
