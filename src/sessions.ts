@@ -51,11 +51,33 @@ export const sameDirectory = (a: string, b: string): boolean => {
 /** Activities that mean the session is still doing something. */
 export const ACTIVE_ACTIVITIES = ['unknown', 'running', 'retrying', 'waiting-permission', 'waiting-question'] as const;
 
-const isSessionActive = (session: AgentSession): boolean => (
-  // Ein gesetztes outcome gewinnt: ein 'running', das kurz vor dem Snapshot
-  // endet, Parken in dieser Gruppe wäre falsch.
-  session.outcome == null && (ACTIVE_ACTIVITIES as readonly string[]).includes(session.activity)
-);
+/** How long an active reading may rest on one `updatedAt` before it stops counting, per activity. */
+export const ACTIVE_STALE_MS: Record<GuestSessionRecord['activity'], number> = {
+  idle: 0,
+  // The host reports 'running' only through live events, and work itself keeps
+  // the session updating; a single long silent tool call can rest one
+  // timestamp for a while, but nothing sane rests one for two hours.
+  running: 2 * 60 * 60 * 1000,
+  retrying: 2 * 60 * 60 * 1000,
+  // 'unknown' is the fallback when the host has nothing live on the session;
+  // genuinely busy work flips to 'running' within seconds, so a short grace
+  // suffices.
+  unknown: 30 * 60 * 1000,
+  // Waiting states rest on the user, not the agent — overnight is normal.
+  'waiting-permission': 24 * 60 * 60 * 1000,
+  'waiting-question': 24 * 60 * 60 * 1000,
+};
+
+const isSessionActive = (session: AgentSession, now: number): boolean => {
+  // Nach einem harten Rechner-Aus (Ausschalten, Strom weg) bleibt der zuletzt
+  // gemeldete Status stehen — 'running' oder 'unknown' mit eingefrorenem
+  // `updatedAt` — und es gibt kein Ereignis, das die Session je außer aktiv
+  // rückt. Echte Arbeit aktualisiert die Session laufend, also gilt ein
+  // aktiver Status nach seiner Frist als Überbleibsel des Abschaltens.
+  return session.outcome == null
+    && (ACTIVE_ACTIVITIES as readonly string[]).includes(session.activity)
+    && now - session.updatedAt < ACTIVE_STALE_MS[session.activity];
+};
 
 /** Finished sessions stay listed this long after their last update. */
 export const FINISHED_WINDOW_MS = 8 * 60 * 60 * 1000;
@@ -122,9 +144,10 @@ export const groupAgentSessions = (
       || session.parentId === null || session.archivedAt !== null
       || (typeof session.agent !== 'string' || !session.agent.trim())) continue;
     if (currentSessionId && !allowedParents.has(session.parentId)) continue;
-    if (!isSessionActive(session) && session.updatedAt < windowStart) continue;
+    const active = isSessionActive(session, now);
+    if (!active && session.updatedAt < windowStart) continue;
     const entry = groups.get(session.agent) ?? { active: [], recent: [] };
-    if (isSessionActive(session)) {
+    if (active) {
       entry.active.push(session);
     } else {
       entry.recent.push(session);

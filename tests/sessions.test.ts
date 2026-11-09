@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildSessionTree, groupActiveSessions, sameDirectory, type AgentSession } from '../src/sessions.ts';
+import { ACTIVE_STALE_MS, buildSessionTree, groupActiveSessions, sameDirectory, type AgentSession } from '../src/sessions.ts';
+
+/** Test base time; relative timestamps keep the staleness cases exact. */
+const NOW = Date.now();
 
 const session = (overrides: Partial<AgentSession> = {}): AgentSession => ({
   id: 's1', title: 'Arbeit', projectId: 'p1', directory: '/project', parentId: 'parent',
-  createdAt: 0, updatedAt: 0, archivedAt: null, worktree: null,
+  createdAt: 0, updatedAt: NOW, archivedAt: null, worktree: null,
   activity: 'running', outcome: null, items: [], agent: 'fixer', ...overrides,
 });
 
@@ -50,6 +53,29 @@ test('no active subagents produces no groups', () => {
     session({ parentId: null }),
   ], 'p1', '/project');
   assert.equal(grouped.size, 0);
+});
+
+test('an active status older than its grace counts as a leftover of a hard shutdown', () => {
+  // Frozen after a power cut: last status 'unknown', never cleared again.
+  const grouped = groupActiveSessions([
+    session({ id: 'unknown-ghost', activity: 'unknown', updatedAt: NOW - ACTIVE_STALE_MS.unknown - 1 }),
+    session({ id: 'running-ghost', activity: 'running', updatedAt: NOW - ACTIVE_STALE_MS.running - 1 }),
+    session({ id: 'permission-ghost', activity: 'waiting-permission', updatedAt: NOW - ACTIVE_STALE_MS['waiting-permission'] - 1 }),
+    session({ id: 'still-fresh', activity: 'unknown', updatedAt: NOW - ACTIVE_STALE_MS.unknown + 60_000 }),
+    session({ id: 'long-call', activity: 'running', updatedAt: NOW - ACTIVE_STALE_MS.running + 60_000 }),
+  ], 'p1', '/project', null, NOW);
+  assert.deepEqual(grouped.get('fixer')?.map((entry) => entry.id), ['still-fresh', 'long-call']);
+});
+
+// Drive the counts through explicit times: inside the grace the session stays
+// active, after it the same snapshot regroups it into the finished window.
+test('a session crosses from active to recent when its grace expires', () => {
+  const updatedAt = NOW - ACTIVE_STALE_MS.unknown + 30_000;
+  const active = groupActiveSessions([session({ activity: 'unknown', updatedAt })], 'p1', '/project', null, NOW);
+  assert.deepEqual(active.get('fixer')?.map((entry) => entry.id), ['s1']);
+  const later = NOW + ACTIVE_STALE_MS.unknown + 10_000;
+  const after = groupActiveSessions([session({ activity: 'unknown', updatedAt })], 'p1', '/project', null, later);
+  assert.equal(after.get('fixer'), undefined);
 });
 
 const current = { id: 'root', title: 'Aktuell', busy: false, agent: 'fixer', model: 'model/id' };
