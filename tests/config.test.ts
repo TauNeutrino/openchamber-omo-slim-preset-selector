@@ -277,7 +277,7 @@ test('reads fallback chains and per-entry variants', () => {
       { model: 'magpie/agy-cli/gemini-4-argon', variant: 'high' },
       { model: 'magpie/grok/grok-4.6' },
       { model: 'opencode-go/glm-5.3' },
-    ] },
+    ], skills: ['simplify'] },
     { agent: 'fixer', models: [{ model: 'opencode-go/deepseek-v4.1-flash' }] },
     { agent: 'helper', models: [], inheritModelFrom: 'orchestrator' },
   ]);

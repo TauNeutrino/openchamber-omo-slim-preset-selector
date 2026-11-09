@@ -46,6 +46,16 @@ export type PresetAgent = {
   inheritModelFrom?: 'session' | 'orchestrator';
   /** The value comes from the root `agents` map, which sits above the preset. */
   source?: 'root';
+  /** The remaining per-agent keys the editor shows; undefined when unset. */
+  temperature?: number;
+  skills?: string[];
+  skillsAdd?: string[];
+  skillsRemove?: string[];
+  skillsLocal?: boolean;
+  mcps?: string[];
+  permission?: unknown;
+  displayName?: string;
+  color?: string;
 };
 
 /** The model the agent actually runs on, or null when its block sets none. */
@@ -188,6 +198,24 @@ export const agentFromOverride = (
   if (variant) result.variant = variant;
   const inherit = override.inheritModelFrom;
   if (inherit === 'session' || inherit === 'orchestrator') result.inheritModelFrom = inherit;
+  if (typeof override.temperature === 'number') result.temperature = override.temperature;
+  const list = (value: unknown): string[] | undefined => (
+    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : undefined
+  );
+  const skills = list(override.skills);
+  if (skills) result.skills = skills;
+  const skillsAdd = list(override.skills_add);
+  if (skillsAdd) result.skillsAdd = skillsAdd;
+  const skillsRemove = list(override.skills_remove);
+  if (skillsRemove) result.skillsRemove = skillsRemove;
+  if (typeof override.skills_include_local === 'boolean') result.skillsLocal = override.skills_include_local;
+  const mcps = list(override.mcps);
+  if (mcps) result.mcps = mcps;
+  if (override.permission !== undefined) result.permission = override.permission;
+  const displayName = nonEmptyString(override.displayName);
+  if (displayName) result.displayName = displayName;
+  const color = nonEmptyString(override.color);
+  if (color) result.color = color;
   if (source) result.source = source;
   return result;
 };
@@ -575,6 +603,386 @@ export const addPresetToText = (
   const after = parseConfigText(next, t('resultLabel'));
   if (!after.ok) throw new Error(`Die Änderung würde die Konfiguration beschädigen: ${after.error}`);
   if (!after.config.presetNames.includes(nextName)) throw new Error(t('changeNotVerified'));
+  return hasBom ? `${BOM}${next}` : next;
+};
+
+export type AgentPatchTarget =
+  | { kind: 'preset'; presetName: string }
+  | { kind: 'root' };
+
+/** Fields the editor may set. `undefined` leaves a field untouched; `null` removes it. */
+export type AgentPatch = {
+  /** The fallback chain, primary first. */
+  models?: PresetModelRef[] | null;
+  variant?: string | null;
+  inheritModelFrom?: 'session' | 'orchestrator' | null;
+  temperature?: number | null;
+  skills?: string[] | null;
+  skills_add?: string[] | null;
+  skills_remove?: string[] | null;
+  skills_include_local?: boolean | null;
+  mcps?: string[] | null;
+  /** A string or object, written verbatim. */
+  permission?: unknown;
+  displayName?: string | null;
+  color?: string | null;
+};
+
+/** Same shape `addPresetToText` writes: one plain model stays a string. */
+const serializeModels = (
+  models: PresetModelRef[],
+): string | Array<string | { id: string; variant: string }> => (
+  models.length === 1 && !models[0].variant
+    ? models[0].model
+    : models.map((ref) => (ref.variant ? { id: ref.model, variant: ref.variant } : ref.model))
+);
+
+/** `undefined` means untouched, `null` means remove, a non-blank string is written trimmed. */
+const patchString = (value: string | null | undefined): string | null | undefined => {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+};
+
+const stableJson = (value: unknown): string => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
+};
+
+const readRoot = (content: string): Record<string, unknown> | null => {
+  const parsed = parseJsonc(content, [], { allowTrailingComma: true });
+  return isPlainObject(parsed) ? parsed : null;
+};
+
+/** The path of the agent inside the document and the block it currently has. */
+type AgentLocation = {
+  path: string[];
+  block: Record<string, unknown> | null;
+};
+
+const locateAgent = (
+  root: Record<string, unknown>,
+  target: AgentPatchTarget,
+  agentName: string,
+): AgentLocation => {
+  if (target.kind === 'root') {
+    const agents = isPlainObject(root.agents) ? root.agents : null;
+    const block = agents && Object.hasOwn(agents, agentName) ? agents[agentName] : undefined;
+    return {
+      path: ['agents', agentName],
+      block: isPlainObject(block) ? block : null,
+    };
+  }
+
+  const presets = isPlainObject(root.presets) ? root.presets : null;
+  const block = presets && Object.hasOwn(presets, target.presetName)
+    ? presets[target.presetName]
+    : undefined;
+  if (!isPlainObject(block)) {
+    throw new Error(t('presetNotDefined', target.presetName, t('configLabel')));
+  }
+
+  const wrapped = isPlainObject(block.agents);
+  const parent = wrapped ? (block.agents as Record<string, unknown>) : block;
+  const agentBlock = Object.hasOwn(parent, agentName) ? parent[agentName] : undefined;
+  return {
+    path: wrapped
+      ? ['presets', target.presetName, 'agents', agentName]
+      : ['presets', target.presetName, agentName],
+    block: isPlainObject(agentBlock) ? agentBlock : null,
+  };
+};
+
+const expectedAgentBlock = (
+  before: Record<string, unknown> | null,
+  patch: AgentPatch,
+): Record<string, unknown> => {
+  const expected: Record<string, unknown> = { ...(before ?? {}) };
+  const remove = (key: string): void => { delete expected[key]; };
+  const assign = (key: string, value: unknown): void => { expected[key] = value; };
+
+  if (patch.models !== undefined) {
+    if (patch.models === null || patch.models.length === 0) remove('model');
+    else assign('model', serializeModels(patch.models));
+  } else if (patch.inheritModelFrom !== undefined && patch.inheritModelFrom !== null) {
+    // The plugin clears an inherited model when no model is configured.
+    remove('model');
+  }
+
+  const variant = patchString(patch.variant);
+  if (variant === null) remove('variant');
+  else if (variant !== undefined) assign('variant', variant);
+
+  if (patch.inheritModelFrom !== undefined) {
+    if (patch.inheritModelFrom === null) remove('inheritModelFrom');
+    else assign('inheritModelFrom', patch.inheritModelFrom);
+  }
+
+  if (patch.temperature !== undefined) {
+    if (patch.temperature === null) remove('temperature');
+    else assign('temperature', patch.temperature);
+  }
+
+  const list = (
+    key: 'skills' | 'skills_add' | 'skills_remove' | 'mcps',
+    value: string[] | null | undefined,
+  ): void => {
+    if (value === undefined) return;
+    if (value === null) remove(key);
+    else assign(key, [...value]);
+  };
+  list('skills', patch.skills);
+  list('skills_add', patch.skills_add);
+  list('skills_remove', patch.skills_remove);
+
+  if (patch.skills_include_local !== undefined) {
+    if (patch.skills_include_local === null) remove('skills_include_local');
+    else assign('skills_include_local', patch.skills_include_local);
+  }
+
+  list('mcps', patch.mcps);
+
+  if (patch.permission !== undefined) {
+    if (patch.permission === null) remove('permission');
+    else assign('permission', patch.permission);
+  }
+
+  const displayName = patchString(patch.displayName);
+  if (displayName === null) remove('displayName');
+  else if (displayName !== undefined) assign('displayName', displayName);
+
+  const color = patchString(patch.color);
+  if (color === null) remove('color');
+  else if (color !== undefined) assign('color', color);
+
+  return expected;
+};
+
+const expectedRootWithAgent = (
+  root: Record<string, unknown>,
+  path: string[],
+  block: Record<string, unknown>,
+): Record<string, unknown> => {
+  const copy = JSON.parse(JSON.stringify(root)) as Record<string, unknown>;
+  let node: Record<string, unknown> = copy;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const key = path[index];
+    if (!isPlainObject(node[key])) node[key] = {};
+    node = node[key] as Record<string, unknown>;
+  }
+  node[path[path.length - 1]] = JSON.parse(JSON.stringify(block));
+  return copy;
+};
+
+const rootWithoutKey = (root: Record<string, unknown>, key: string): string => {
+  const copy = { ...root };
+  delete copy[key];
+  return JSON.stringify(copy);
+};
+
+const valueAtPath = (root: unknown, path: string[]): unknown => {
+  let node: unknown = root;
+  for (const key of path) {
+    if (!isPlainObject(node) || !Object.hasOwn(node, key)) return undefined;
+    node = node[key];
+  }
+  return node;
+};
+
+const deleteAtPath = (
+  root: Record<string, unknown>,
+  path: string[],
+): Record<string, unknown> => {
+  let node: Record<string, unknown> = root;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const child = node[path[index]];
+    if (!isPlainObject(child)) return root;
+    node = child;
+  }
+  delete node[path[path.length - 1]];
+  return root;
+};
+
+const verifyAgentWrite = (
+  beforeRoot: Record<string, unknown>,
+  afterRoot: Record<string, unknown>,
+  target: AgentPatchTarget,
+  agentName: string,
+  path: string[],
+  expectedBlock: Record<string, unknown>,
+): void => {
+  const expectedRoot = expectedRootWithAgent(beforeRoot, path, expectedBlock);
+  if (stableJson(afterRoot) !== stableJson(expectedRoot)) {
+    throw new Error(t('changeNotVerified'));
+  }
+
+  const touchedKey = target.kind === 'preset' ? 'presets' : 'agents';
+  if (rootWithoutKey(afterRoot, touchedKey) !== rootWithoutKey(beforeRoot, touchedKey)) {
+    throw new Error(t('changeNotVerified'));
+  }
+
+  const afterValue = valueAtPath(afterRoot, path);
+  const afterBlock = isPlainObject(afterValue) ? afterValue : null;
+  if (!afterBlock) throw new Error(t('changeNotVerified'));
+
+  // The parsed model/variant/inheritance view must match the expected one.
+  const expectedAgent = agentFromOverride(agentName, expectedBlock as AgentOverride);
+  const actualAgent = agentFromOverride(agentName, afterBlock as AgentOverride);
+  if (stableJson(expectedAgent) !== stableJson(actualAgent)) {
+    throw new Error(t('changeNotVerified'));
+  }
+  if (primaryModel(actualAgent) !== primaryModel(expectedAgent)) {
+    throw new Error(t('changeNotVerified'));
+  }
+
+  const fields = [
+    'temperature',
+    'skills',
+    'skills_add',
+    'skills_remove',
+    'skills_include_local',
+    'mcps',
+    'permission',
+    'displayName',
+    'color',
+  ] as const;
+  for (const field of fields) {
+    if (stableJson(afterBlock[field]) !== stableJson(expectedBlock[field])) {
+      throw new Error(t('changeNotVerified'));
+    }
+  }
+};
+
+/**
+ * Applies an agent patch in place. Only the keys the patch names are touched;
+ * formatting, comments, BOM and every sibling stay as they were. Throws instead
+ * of returning a result that could not be verified.
+ */
+export const applyAgentPatchToText = (
+  raw: string,
+  target: AgentPatchTarget,
+  agentName: string,
+  patch: AgentPatch,
+): string => {
+  const nextAgent = agentName.trim();
+  if (!nextAgent) throw new Error(t('presetNameEmpty'));
+
+  const before = parseConfigText(raw, t('configLabel'));
+  if (!before.ok) throw new Error(before.error);
+  if (before.config.commentOnly) throw new Error(t('changeNotVerified'));
+
+  const hasBom = raw.startsWith(BOM);
+  const content = hasBom ? raw.slice(1) : raw;
+  const root = readRoot(content);
+  if (!root) throw new Error(t('mustBeJsonObject'));
+
+  const location = locateAgent(root, target, nextAgent);
+  const expected = expectedAgentBlock(location.block, patch);
+
+  const fmt = formattingFor(content);
+  let next = content;
+  const setField = (key: string, value: unknown): void => {
+    const edits = modify(
+      next,
+      [...location.path, key],
+      value === null ? undefined : value,
+      { formattingOptions: fmt },
+    );
+    next = applyEdits(next, edits);
+  };
+
+  if (patch.models !== undefined) {
+    if (patch.models === null || patch.models.length === 0) setField('model', null);
+    else setField('model', serializeModels(patch.models));
+  } else if (patch.inheritModelFrom !== undefined && patch.inheritModelFrom !== null) {
+    setField('model', null);
+  }
+
+  const variant = patchString(patch.variant);
+  if (variant !== undefined) setField('variant', variant);
+
+  if (patch.inheritModelFrom !== undefined) setField('inheritModelFrom', patch.inheritModelFrom);
+  if (patch.temperature !== undefined) setField('temperature', patch.temperature);
+  if (patch.skills !== undefined) setField('skills', patch.skills);
+  if (patch.skills_add !== undefined) setField('skills_add', patch.skills_add);
+  if (patch.skills_remove !== undefined) setField('skills_remove', patch.skills_remove);
+  if (patch.skills_include_local !== undefined) {
+    setField('skills_include_local', patch.skills_include_local);
+  }
+  if (patch.mcps !== undefined) setField('mcps', patch.mcps);
+  if (patch.permission !== undefined) setField('permission', patch.permission);
+
+  const displayName = patchString(patch.displayName);
+  if (displayName !== undefined) setField('displayName', displayName);
+
+  const color = patchString(patch.color);
+  if (color !== undefined) setField('color', color);
+
+  const after = parseConfigText(next, t('resultLabel'));
+  if (!after.ok) throw new Error(`Die Änderung würde die Konfiguration beschädigen: ${after.error}`);
+  const afterRoot = readRoot(next);
+  if (!afterRoot) throw new Error(t('changeNotVerified'));
+
+  verifyAgentWrite(root, afterRoot, target, nextAgent, location.path, expected);
+  return hasBom ? `${BOM}${next}` : next;
+};
+
+const agentNotDefined = (agentName: string, target: AgentPatchTarget): string => (
+  target.kind === 'preset'
+    ? `Agent "${agentName}" ist im Preset "${target.presetName}" nicht definiert. Es wurde nichts geschrieben.`
+    : `Agent "${agentName}" ist in den Root-agents nicht definiert. Es wurde nichts geschrieben.`
+);
+
+/** Removes one agent from the target, keeping an empty preset `agents` wrapper. */
+export const removeAgentFromText = (
+  raw: string,
+  target: AgentPatchTarget,
+  agentName: string,
+): string => {
+  const nextAgent = agentName.trim();
+  if (!nextAgent) throw new Error(t('presetNameEmpty'));
+
+  const before = parseConfigText(raw, t('configLabel'));
+  if (!before.ok) throw new Error(before.error);
+  if (before.config.commentOnly) throw new Error(t('changeNotVerified'));
+
+  const hasBom = raw.startsWith(BOM);
+  const content = hasBom ? raw.slice(1) : raw;
+  const root = readRoot(content);
+  if (!root) throw new Error(t('mustBeJsonObject'));
+
+  const location = locateAgent(root, target, nextAgent);
+  if (valueAtPath(root, location.path) === undefined) {
+    throw new Error(agentNotDefined(nextAgent, target));
+  }
+
+  const fmt = formattingFor(content);
+  const next = applyEdits(content, modify(content, location.path, undefined, { formattingOptions: fmt }));
+
+  const after = parseConfigText(next, t('resultLabel'));
+  if (!after.ok) throw new Error(`Die Änderung würde die Konfiguration beschädigen: ${after.error}`);
+  const afterRoot = readRoot(next);
+  if (!afterRoot) throw new Error(t('changeNotVerified'));
+
+  const expectedRoot = deleteAtPath(JSON.parse(JSON.stringify(root)) as Record<string, unknown>, location.path);
+  if (stableJson(afterRoot) !== stableJson(expectedRoot)) {
+    throw new Error(t('changeNotVerified'));
+  }
+
+  const touchedKey = target.kind === 'preset' ? 'presets' : 'agents';
+  if (rootWithoutKey(afterRoot, touchedKey) !== rootWithoutKey(root, touchedKey)) {
+    throw new Error(t('changeNotVerified'));
+  }
+  if (valueAtPath(afterRoot, location.path) !== undefined) {
+    throw new Error(t('changeNotVerified'));
+  }
+
   return hasBom ? `${BOM}${next}` : next;
 };
 
