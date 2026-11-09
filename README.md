@@ -44,7 +44,7 @@ After every load (and then every 15 minutes) the panel checks whether the config
 
 ## Fallback chains
 
-`model` may be a string or an array of strings and `{ "id", "variant" }` entries, which oh-my-opencode-slim tries in order. The panel shows the primary model plus a `+N` badge for the remaining candidates; the tooltip lists the whole chain. Every entry is checked against the catalog. Changing a model from the picker replaces the primary and keeps the other candidates as fallbacks; a model already in the chain is not duplicated. Agents that only set `inheritModelFrom` (`session` / `orchestrator`) are listed with that source instead of a model.
+`model` may be a string or an array of strings and `{ "id", "variant" }` entries, which oh-my-opencode-slim tries in order. The panel shows the primary model plus a `+N` badge for the remaining candidates (`+0` when there is no fallback, so the badge column stays aligned); the tooltip lists the whole chain. Every entry is checked against the catalog. Changing a model from the picker replaces the primary and keeps the other candidates as fallbacks; a model already in the chain is not duplicated. Agents that only set `inheritModelFrom` (`session` / `orchestrator`) are listed with that source instead of a model.
 
 ## Sessions per agent
 

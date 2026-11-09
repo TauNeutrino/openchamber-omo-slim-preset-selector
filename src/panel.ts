@@ -302,10 +302,12 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
   }
   value.append(model);
   const pills = element('span', 'agent-pills');
-  const fallbackCount = Math.max(agent.models.length - 1, 0);
-  if (fallbackCount > 0) {
-    const fallback = element('span', 'variant fallback-count', `+${fallbackCount}`);
-    fallback.title = t('fallbackModels', fallbackCount);
+  if (agent.models.length > 0) {
+    // Always render the count, even at zero: a row without any pill used to
+    // start its model text at a different width and broke the pill column.
+    const fallbackCount = agent.models.length - 1;
+    const fallback = element('span', fallbackCount > 0 ? 'variant fallback-count' : 'variant fallback-count is-zero', `+${fallbackCount}`);
+    fallback.title = fallbackCount > 0 ? t('fallbackModels', fallbackCount) : t('noFallbackModels');
     pills.append(fallback);
   }
   const variant = primaryVariant(agent);

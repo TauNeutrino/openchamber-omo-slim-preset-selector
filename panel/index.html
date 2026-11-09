@@ -294,6 +294,10 @@
         border-style: dashed;
         font-size: 8px;
       }
+      /* Zero fallbacks still occupy the column, but stay out of the way. */
+      .variant.fallback-count.is-zero {
+        opacity: 0.5;
+      }
       /* Session-Baum: eingerückt unter dem Agenten, keine eigene Box,
          Schriftgröße maximal auf Höhe des Agenten-Texts. */
       .session-list {

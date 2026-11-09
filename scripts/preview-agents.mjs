@@ -15,7 +15,9 @@ const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.u
 /** agentRow() markup: one row per agent, chains as +N, optional sessions. */
 const row = ({ name, provider, id, fallbacks = 0, variant = '', sessions = null, recent = 0, missing = false, inherited = '', open = false }) => {
   const pills = [
-    fallbacks ? `<span class="variant fallback-count" title="${fallbacks} fallback models">+${fallbacks}</span>` : '',
+    provider
+      ? `<span class="variant fallback-count${fallbacks ? '' : ' is-zero'}" title="${fallbacks ? `${fallbacks} fallback models` : 'no fallback models'}">+${fallbacks}</span>`
+      : '',
     variant ? `<span class="variant"><span class="model-content">${variant}</span></span>` : '',
     inherited && provider ? `<span class="variant" title="inherits from ${inherited}">⇢ ${inherited}</span>` : '',
   ].filter(Boolean).join('');
