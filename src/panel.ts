@@ -10,7 +10,8 @@ import {
 
 import {
   addPresetToText,
-  applyAgentModelToText,
+  agentFromOverride,
+  applyAgentPatchToText,
   applyPresetToText,
   clearPresetFromText,
   orchestratorModel,
@@ -18,13 +19,23 @@ import {
   planPresetSwitch,
   primaryModel,
   primaryVariant,
+  removeAgentFromText,
   resolvePresetView,
   sortedPresetNames,
   type ParsedLayer,
   type PresetAgent,
+  type PresetModelRef,
   type PresetSwitchScope,
   type PresetView,
 } from './config.ts';
+import {
+  draftFromAgent,
+  moveInChain,
+  patchFromDraft,
+  removeFromChain,
+  setChainVariant,
+  type AgentEditorDraft,
+} from './agent-editor.ts';
 import { countGlyph, groupAgentSessions, rootSessionId, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
 import { setLocale, t } from './i18n.ts';
 import { auditModelRefs, collectModelRefs, type ModelAudit } from './model-audit.ts';
@@ -116,7 +127,18 @@ let presetEditingEnabled = false;
 /** Last session snapshot as delivered by the host, for regrouping when the window changes. */
 let lastSessionSnapshot: { records: AgentSession[]; projectId: string; directory: string; sessionId: string | null } | null = null;
 /** Model picker state when preset editing is enabled. */
-let modelPicker: { agent: string; presetName: string; targetPath: string; currentModel: string; currentVariant: string } | null = null;
+type AgentEditor = {
+  agent: string;
+  presetName: string;
+  target: { scope: 'preset' | 'root'; layer: 'global' | 'project' };
+  draft: AgentEditorDraft;
+  chainOpen: boolean;
+  advancedOpen: boolean;
+  pickerMode: null | 'replace-primary' | 'add-fallback';
+  pickerIndex: number;
+  removeConfirm: boolean;
+};
+let agentEditor: AgentEditor | null = null;
 let pickerFilter = '';
 let pickerAppliedFilter = '';
 let pickerDebounce: ReturnType<typeof setTimeout> | 0 = 0;
@@ -399,6 +421,439 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
     group.append(list);
   }
   return group;
+};
+
+/** One segmented control; every `dest-segment` in the editor uses it. */
+const editorSegment = (
+  label: string,
+  options: ReadonlyArray<{ value: string; label: string }>,
+  current: string,
+  onPick: (value: string) => void,
+): HTMLElement => {
+  const wrap = element('span', 'dest-segment');
+  wrap.setAttribute('role', 'group');
+  wrap.setAttribute('aria-label', label);
+  for (const option of options) {
+    const selected = option.value === current;
+    const button = element('button', selected ? 'dest-btn is-selected' : 'dest-btn', option.label);
+    button.type = 'button';
+    button.setAttribute('aria-pressed', String(selected));
+    button.addEventListener('click', () => onPick(option.value));
+    wrap.append(button);
+  }
+  return wrap;
+};
+
+const editorField = (labelText: string, control: HTMLElement, forId?: string): HTMLElement => {
+  const field = element('div', 'editor-field');
+  const label = element('label', 'editor-label', labelText);
+  if (forId) label.setAttribute('for', forId);
+  field.append(label, control);
+  return field;
+};
+
+const editorTextInput = (
+  id: string,
+  value: string,
+  placeholder: string,
+  onInput: (value: string) => void,
+): HTMLInputElement => {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.id = id;
+  input.className = 'editor-input';
+  input.value = value;
+  if (placeholder) input.placeholder = placeholder;
+  input.addEventListener('input', () => onInput(input.value));
+  return input;
+};
+
+/** The per-agent editor: destination, fallback chain, advanced keys, footer. */
+const paintAgentEditor = (panel: HTMLElement, model: ReadyModel): void => {
+  const editor = agentEditor;
+  if (!editor) return;
+  const draft = editor.draft;
+  const card = element('div', 'agent-editor');
+  card.tabIndex = -1;
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-label', t('editorTitle', editor.agent));
+
+  const head = element('div', 'editor-head');
+  head.append(element('div', 'editor-title', editor.agent));
+  head.append(element('div', 'editor-subtitle', t(
+    'editorSubtitle',
+    editor.presetName,
+    editor.target.layer === 'project' ? t('editorLayerProject') : t('editorLayerGlobal'),
+  )));
+  card.append(head);
+
+  const destination = element('div', 'editor-destination');
+  const destRow = element('div', 'editor-dest-row');
+  destRow.append(element('span', 'editor-dest-label', t('editorWriteTo')));
+  destRow.append(editorSegment(t('editorScope'), [
+    { value: 'preset', label: t('editorScopePreset', editor.presetName) },
+    { value: 'root', label: t('editorScopeRoot') },
+  ], editor.target.scope, (value) => {
+    if (!agentEditor) return;
+    agentEditor.target.scope = value === 'root' ? 'root' : 'preset';
+    resetEditorDraft(model, agentEditor);
+    paint();
+  }));
+  destRow.append(element('span', 'editor-dest-label', t('editorIn')));
+  destRow.append(editorSegment(t('editorLayer'), [
+    { value: 'global', label: t('editorLayerGlobal') },
+    { value: 'project', label: t('editorLayerProject') },
+  ], editor.target.layer, (value) => {
+    if (!agentEditor) return;
+    agentEditor.target.layer = value === 'project' ? 'project' : 'global';
+    resetEditorDraft(model, agentEditor);
+    paint();
+  }));
+  destination.append(destRow);
+  const pathLine = element('div', 'editor-path', editorTargetPath(model, editor));
+  pathLine.title = pathLine.textContent ?? '';
+  destination.append(pathLine);
+  if (editorIsShadowed(model, editor)) {
+    const warning = element('div', 'confirm-warning');
+    warning.append(element('div', 'confirm-warning-text', t('editorShadowed', editor.agent, editor.presetName)));
+    destination.append(warning);
+  }
+  card.append(destination);
+
+  // Model chain, primary first.
+  const chainSection = element('div', 'editor-section');
+  const chainTitle = element('button', 'editor-section-title');
+  chainTitle.type = 'button';
+  chainTitle.setAttribute('aria-expanded', String(editor.chainOpen));
+  chainTitle.append(document.createTextNode(t('editorChain')), element('span', 'editor-chevron', editor.chainOpen ? '▴' : '▾'));
+  chainTitle.addEventListener('click', () => {
+    if (!agentEditor) return;
+    agentEditor.chainOpen = !agentEditor.chainOpen;
+    paint();
+  });
+  chainSection.append(chainTitle);
+
+  if (editor.chainOpen) {
+    const body = element('div', 'editor-chain');
+    body.append(element('div', 'chain-legend', t('editorChainLegend')));
+    if (draft.chain.length === 0) {
+      body.append(element('div', 'editor-help', draft.inherit ? t('inheritsFrom', draft.inherit) : t('noModelSet')));
+    } else {
+      const list = element('div', 'chain-list');
+      draft.chain.forEach((ref, index) => {
+        const item = element('div', index === 0 ? 'chain-item is-primary' : 'chain-item');
+        item.append(element('span', 'chain-rank', String(index + 1)));
+        const name = element('span', 'chain-model', ref.model);
+        name.title = `${t('editorReplaceModel')} · ${ref.model}`;
+        name.style.cursor = 'pointer';
+        name.addEventListener('click', () => {
+          if (!agentEditor) return;
+          agentEditor.pickerMode = 'replace-primary';
+          agentEditor.pickerIndex = index;
+          pickerFilter = '';
+          pickerAppliedFilter = '';
+          paint();
+        });
+        item.append(name);
+        const variant = document.createElement('input');
+        variant.type = 'text';
+        variant.className = 'chain-variant';
+        variant.value = ref.variant ?? '';
+        variant.placeholder = 'variant';
+        variant.setAttribute('aria-label', t('editorChainVariant', ref.model));
+        variant.addEventListener('change', () => {
+          if (!agentEditor) return;
+          agentEditor.draft.chain = setChainVariant(agentEditor.draft.chain, index, variant.value);
+        });
+        item.append(variant);
+        const actions = element('span', 'chain-actions');
+        const actionButton = (glyph: string, label: string, disabled: boolean, onClick: () => void, remove = false): HTMLElement => {
+          const button = element('button', remove ? 'chain-btn is-remove' : 'chain-btn', glyph);
+          button.type = 'button';
+          button.title = label;
+          button.setAttribute('aria-label', label);
+          button.disabled = disabled;
+          button.addEventListener('click', onClick);
+          return button;
+        };
+        actions.append(
+          actionButton('↑', t('chainMoveUp'), index === 0, () => {
+            if (!agentEditor) return;
+            agentEditor.draft.chain = moveInChain(agentEditor.draft.chain, index, index - 1);
+            paint();
+          }),
+          actionButton('↓', t('chainMoveDown'), index === draft.chain.length - 1, () => {
+            if (!agentEditor) return;
+            agentEditor.draft.chain = moveInChain(agentEditor.draft.chain, index, index + 1);
+            paint();
+          }),
+          actionButton('★', t('chainMakePrimary'), index === 0, () => {
+            if (!agentEditor) return;
+            agentEditor.draft.chain = moveInChain(agentEditor.draft.chain, index, 0);
+            paint();
+          }),
+          actionButton('×', t('chainRemove'), false, () => {
+            if (!agentEditor) return;
+            agentEditor.draft.chain = removeFromChain(agentEditor.draft.chain, index);
+            paint();
+          }, true),
+        );
+        item.append(actions);
+        list.append(item);
+      });
+      body.append(list);
+    }
+    const add = element('button', 'chain-add', t('chainAddFallback'));
+    add.type = 'button';
+    add.addEventListener('click', () => {
+      if (!agentEditor) return;
+      agentEditor.pickerMode = 'add-fallback';
+      pickerFilter = '';
+      pickerAppliedFilter = '';
+      paint();
+    });
+    body.append(add);
+    chainSection.append(body);
+  }
+  card.append(chainSection);
+
+  // Embedded model search, shown only while adding/replacing.
+  if (editor.pickerMode) {
+    const box = element('div', 'model-picker editor-picker');
+    const boxHead = element('div', 'picker-head');
+    const title = editor.pickerMode === 'add-fallback' ? t('chainAddTitle') : t('chainReplaceTitle');
+    boxHead.append(element('span', 'picker-title', `${title} · ${modelCatalog.length}`));
+    const close = element('button', 'icon-btn', '×');
+    close.type = 'button';
+    close.title = t('cancel');
+    close.addEventListener('click', () => {
+      if (!agentEditor) return;
+      agentEditor.pickerMode = null;
+      paint();
+    });
+    boxHead.append(close);
+    box.append(boxHead);
+
+    const list = element('div', 'picker-list');
+    const fillList = (filterText: string): void => {
+      list.replaceChildren();
+      const filter = filterText.trim().toLowerCase();
+      const items = modelCatalog.filter((entry) => !filter || entry.toLowerCase().includes(filter));
+      if (items.length === 0) {
+        list.append(element('div', 'picker-empty', modelCatalog.length === 0 ? t('modelCheckLabel') : t('noModelsMatchingFilter')));
+        return;
+      }
+      for (const entry of items) {
+        const row = element('div', 'picker-row');
+        const option = element('button', 'picker-option');
+        option.type = 'button';
+        option.title = entry;
+        option.append(element('span', 'picker-option-text', entry));
+        option.addEventListener('click', () => applyEditorPick(entry));
+        row.append(option);
+        const reported = modelVariants[entry] ?? [];
+        const variants = reported.length ? reported : (entry.startsWith('opencode/') || entry.startsWith('opencode-go/')) ? ['low', 'medium', 'high', 'xhigh', 'max'] : [];
+        if (variants.length) {
+          const wrap = element('span', 'picker-variants');
+          for (const variant of variants) {
+            const pill = element('button', 'variant-pill', variant);
+            pill.type = 'button';
+            pill.title = `${entry} (${variant})`;
+            pill.addEventListener('click', (event) => {
+              event.stopPropagation();
+              applyEditorPick(entry, variant);
+            });
+            wrap.append(pill);
+          }
+          row.append(wrap);
+        }
+        list.append(row);
+      }
+    };
+    const search = editorTextInput('editor-model-search', pickerFilter, t('filterModels'), (value) => {
+      pickerFilter = value;
+      // Filter in place: a full repaint would steal the caret from the field.
+      fillList(value);
+    });
+    box.append(search);
+    fillList(pickerAppliedFilter);
+    box.append(list);
+    card.append(box);
+  }
+
+  // Advanced keys, collapsed unless the user opens them.
+  const advanced = element('div', 'editor-section');
+  const advancedTitle = element('button', 'editor-section-title');
+  advancedTitle.type = 'button';
+  advancedTitle.setAttribute('aria-expanded', String(editor.advancedOpen));
+  advancedTitle.append(document.createTextNode(t('editorAdvanced')), element('span', 'editor-chevron', editor.advancedOpen ? '▴' : '▾'));
+  advancedTitle.addEventListener('click', () => {
+    if (!agentEditor) return;
+    agentEditor.advancedOpen = !agentEditor.advancedOpen;
+    paint();
+  });
+  advanced.append(advancedTitle);
+  if (editor.advancedOpen) {
+    const body = element('div', 'editor-advanced');
+
+    const inheritField = element('div', 'editor-field is-row');
+    inheritField.append(element('span', 'editor-label', t('editorInherit')));
+    inheritField.append(editorSegment(t('editorInherit'), [
+      { value: '', label: t('inheritNone') },
+      { value: 'session', label: 'session' },
+      { value: 'orchestrator', label: 'orchestrator' },
+    ], draft.inherit, (value) => {
+      if (!agentEditor) return;
+      agentEditor.draft.inherit = value === 'session' || value === 'orchestrator' ? value : '';
+      paint();
+    }));
+    body.append(inheritField);
+
+    const temperature = document.createElement('input');
+    temperature.type = 'number';
+    temperature.id = 'editor-temperature';
+    temperature.className = 'editor-input';
+    temperature.min = '0';
+    temperature.max = '2';
+    temperature.step = '0.1';
+    temperature.value = draft.temperature;
+    temperature.addEventListener('input', () => {
+      if (agentEditor) agentEditor.draft.temperature = temperature.value;
+    });
+    body.append(editorField(t('editorTemperature'), temperature, 'editor-temperature'));
+
+    body.append(editorField(t('editorSkills'), editorTextInput('editor-skills', draft.skills, t('editorListHint'), (value) => {
+      if (agentEditor) agentEditor.draft.skills = value;
+    }), 'editor-skills'));
+    body.append(editorField(t('editorSkillsAdd'), editorTextInput('editor-skills-add', draft.skillsAdd, '', (value) => {
+      if (agentEditor) agentEditor.draft.skillsAdd = value;
+    }), 'editor-skills-add'));
+    body.append(editorField(t('editorSkillsRemove'), editorTextInput('editor-skills-remove', draft.skillsRemove, '', (value) => {
+      if (agentEditor) agentEditor.draft.skillsRemove = value;
+    }), 'editor-skills-remove'));
+
+    const localRow = element('label', 'editor-checkbox-row');
+    const localBox = document.createElement('input');
+    localBox.type = 'checkbox';
+    localBox.checked = draft.skillsLocal;
+    localBox.addEventListener('change', () => {
+      if (agentEditor) agentEditor.draft.skillsLocal = localBox.checked;
+    });
+    localRow.append(localBox, element('span', '', t('editorSkillsLocal')));
+    body.append(localRow);
+
+    body.append(editorField(t('editorMcps'), editorTextInput('editor-mcps', draft.mcps, t('editorListHint'), (value) => {
+      if (agentEditor) agentEditor.draft.mcps = value;
+    }), 'editor-mcps'));
+
+    const perm = element('div', 'editor-perm');
+    const permRow = element('div', 'editor-perm-row');
+    permRow.append(element('span', 'editor-label', t('editorPermission')));
+    permRow.append(editorSegment(t('editorPermission'), [
+      { value: 'allow', label: 'allow' },
+      { value: 'ask', label: 'ask' },
+      { value: 'deny', label: 'deny' },
+    ], draft.permissionMode, (value) => {
+      if (!agentEditor) return;
+      const mode = value === 'allow' || value === 'ask' || value === 'deny' ? value : '';
+      agentEditor.draft.permissionMode = mode;
+      agentEditor.draft.permissionJson = '';
+      paint();
+    }));
+    const jsonButton = element('button', 'editor-json-btn', '{}');
+    jsonButton.type = 'button';
+    jsonButton.title = t('editorPermissionJson');
+    if (draft.permissionMode === 'json') jsonButton.classList.add('is-selected');
+    jsonButton.addEventListener('click', () => {
+      if (!agentEditor) return;
+      const previous = agentEditor.draft.permissionMode;
+      agentEditor.draft.permissionMode = 'json';
+      if (!agentEditor.draft.permissionJson.trim()) {
+        // Carry the current stance into the JSON view instead of an empty box.
+        agentEditor.draft.permissionJson = previous && previous !== 'json'
+          ? JSON.stringify(previous)
+          : '{}';
+      }
+      paint();
+    });
+    permRow.append(jsonButton);
+    perm.append(permRow);
+    if (draft.permissionMode === 'json') {
+      const json = document.createElement('textarea');
+      json.className = 'editor-textarea';
+      json.value = draft.permissionJson;
+      json.placeholder = '{ "edit": "allow" }';
+      json.addEventListener('input', () => {
+        if (agentEditor) agentEditor.draft.permissionJson = json.value;
+      });
+      perm.append(json);
+    }
+    body.append(perm);
+
+    body.append(editorField(t('editorDisplayName'), editorTextInput('editor-display', draft.displayName, '', (value) => {
+      if (agentEditor) agentEditor.draft.displayName = value;
+    }), 'editor-display'));
+
+    const colorInput = editorTextInput('editor-color', draft.color, 'primary / success / #ff0000', (value) => {
+      if (agentEditor) agentEditor.draft.color = value;
+    });
+    const colors = document.createElement('datalist');
+    colors.id = 'editor-color-suggestions';
+    for (const value of ['primary', 'secondary', 'accent', 'success', 'warning', 'error', 'info']) {
+      const option = document.createElement('option');
+      option.value = value;
+      colors.append(option);
+    }
+    colorInput.setAttribute('list', colors.id);
+    body.append(editorField(t('editorColor'), colorInput, 'editor-color'), colors);
+
+    advanced.append(body);
+  }
+  card.append(advanced);
+
+  // Footer: save/cancel plus removal, which needs a second click.
+  const footer = element('div', 'editor-footer');
+  const actions = element('div', 'editor-actions');
+  const cancel = element('button', 'editor-cancel', t('cancel'));
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => { closeAgentEditor(); paint(); });
+  const save = element('button', 'editor-save', t('editorSave'));
+  save.type = 'button';
+  save.addEventListener('click', () => { void saveAgentEditor(); });
+  actions.append(cancel, save);
+  footer.append(actions);
+
+  const removeRow = element('div', 'editor-remove-row');
+  const where = editor.target.scope === 'root'
+    ? t('editorScopeRoot')
+    : t('editorScopePreset', editor.presetName);
+  if (editor.removeConfirm) {
+    removeRow.append(element('span', 'remove-prompt', t('editorRemovePrompt', editor.agent, where)));
+    const confirm = element('button', 'editor-remove-confirm', t('editorRemoveCta'));
+    confirm.type = 'button';
+    confirm.addEventListener('click', () => { void removeAgentFromTarget(); });
+    const keep = element('button', 'editor-remove-cancel', t('cancel'));
+    keep.type = 'button';
+    keep.addEventListener('click', () => {
+      if (!agentEditor) return;
+      agentEditor.removeConfirm = false;
+      paint();
+    });
+    removeRow.append(confirm, keep);
+  } else {
+    const remove = element('button', 'editor-remove', t('editorRemoveFrom', where));
+    remove.type = 'button';
+    remove.addEventListener('click', () => {
+      if (!agentEditor) return;
+      agentEditor.removeConfirm = true;
+      paint();
+    });
+    removeRow.append(remove);
+  }
+  footer.append(removeRow);
+  card.append(footer);
+
+  panel.append(card);
 };
 
 const relativeTime = (timestamp: number): string => {
@@ -892,110 +1347,12 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
   if (model.view.agents.length === 0) {
     agents.append(element('div', 'agents-empty', t('noAgentsConfigured')));
   } else {
-    for (const agent of model.view.agents) agents.append(agentRow(agent, presetEditingEnabled, (a) => openModelPicker(a, model)));
+    for (const agent of model.view.agents) agents.append(agentRow(agent, presetEditingEnabled, (a) => openAgentEditor(a, model)));
   }
   panel.append(agents);
 
-  if (modelPicker) {
-    const box = element('div', 'model-picker');
-    const head = element('div', 'picker-head');
-    head.append(element('span', 'picker-title', `${modelPicker.agent} · ${modelCatalog.length} Modelle`));
-    const close = element('button', 'icon-btn', '×');
-    close.type = 'button';
-    close.title = t('cancel');
-    close.addEventListener('click', () => { closeModelPicker(); paint(); });
-    head.append(close);
-    box.append(head);
-    // Unsichtbares Eingabefeld, damit Tastatureingabe zuverlässig erfasst wird
-    // (kein sichtbares Input-Feld, nur die Modellliste).
-    const hiddenInput = document.createElement('input');
-    hiddenInput.type = 'text';
-    hiddenInput.className = 'picker-hidden-input';
-    hiddenInput.value = pickerFilter;
-    hiddenInput.setAttribute('aria-hidden', 'true');
-    hiddenInput.tabIndex = -1;
-    hiddenInput.style.position = 'absolute';
-    hiddenInput.style.opacity = '0';
-    hiddenInput.style.width = '1px';
-    hiddenInput.style.height = '1px';
-    hiddenInput.style.border = '0';
-    hiddenInput.style.padding = '0';
-    hiddenInput.style.pointerEvents = 'none';
-    hiddenInput.addEventListener('input', () => {
-      pickerFilter = hiddenInput.value;
-      if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
-      pickerDebounce = setTimeout(() => { pickerAppliedFilter = pickerFilter; paint(); }, 500);
-      paint();
-    });
-    box.append(hiddenInput);
-    setTimeout(() => { try { hiddenInput.focus(); } catch {} }, 0);
-    if (pickerFilter) {
-      box.append(element('div', 'picker-filter', `Filter: ${pickerFilter}`));
-    }
-    const list = element('div', 'picker-list');
-    const filter = pickerAppliedFilter.toLowerCase();
-    const items = modelCatalog.filter((m) => !filter || m.toLowerCase().includes(filter));
-    if (items.length === 0) {
-      const emptyMsg = modelCatalog.length === 0
-        ? t('modelCheckLabel')
-        : (pickerAppliedFilter ? t('noModelsMatchingFilter') : t('noModelsConfigured'));
-      list.append(element('div', 'picker-empty', emptyMsg));
-    } else {
-      for (const m of items) {
-        const row = element('div', 'picker-row');
-        const opt = element('button', 'picker-option');
-        opt.type = 'button';
-        opt.title = m;
-        const optText = element('span', 'picker-option-text', m);
-        opt.append(optText);
-        if (m === modelPicker.currentModel) {
-          opt.classList.add('is-current');
-          row.classList.add('is-current-row');
-        }
-        opt.addEventListener('click', () => { void applyPickedModel(m); });
-        row.append(opt);
-        const reported = modelVariants[m] ?? [];
-        const variants = reported.length ? reported : (m.startsWith('opencode/') || m.startsWith('opencode-go/')) ? ['low', 'medium', 'high', 'xhigh', 'max'] : [];
-        if (variants.length) {
-          const vwrap = element('span', 'picker-variants');
-          for (const v of variants) {
-            const pill = element('button', 'variant-pill', v);
-            pill.type = 'button';
-            pill.title = `${m} (${v})`;
-            if (m === modelPicker.currentModel && v === modelPicker.currentVariant) pill.classList.add('is-active');
-            pill.addEventListener('click', (e) => {
-              e.stopPropagation();
-              void applyPickedModel(m, v);
-            });
-            vwrap.append(pill);
-          }
-          row.append(vwrap);
-        } else {
-          const vinput = document.createElement('input');
-          vinput.type = 'text';
-          vinput.className = 'variant-input';
-          vinput.placeholder = 'variant';
-          vinput.title = t('cloneName');
-          vinput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault();
-              e.stopPropagation();
-              const v = vinput.value.trim();
-              void applyPickedModel(m, v);
-            }
-          });
-          row.append(vinput);
-        }
-        list.append(row);
-      }
-    }
-    box.append(list);
-    panel.append(box);
-    // Scroll to the currently selected model (center).
-    setTimeout(() => {
-      const node = list.querySelector('.is-current-row') as HTMLElement | null;
-      if (node) node.scrollIntoView({ block: 'center' });
-    }, 0);
+  if (agentEditor) {
+    paintAgentEditor(panel, model);
   }
 };
 
@@ -1192,50 +1549,181 @@ const fetchModelCatalog = async (): Promise<void> => {
   }
 };
 
-const openModelPicker = (agent: PresetAgent, model: ReadyModel): void => {
-  const project = model.project;
-  const global = model.global;
-  const origin = model.view.origins[model.view.active.name] ?? 'global';
-  let targetPath = global.path;
-  if (project && (origin === 'project' || origin === 'both')) targetPath = project.path;
-  modelPicker = {
-    agent: agent.agent,
-    presetName: model.view.active.name,
-    targetPath,
-    currentModel: primaryModel(agent) ?? '',
-    currentVariant: primaryVariant(agent),
-  };
+/** The layer object the editor targets, or null when the project is closed. */
+const editorLayer = (model: ReadyModel, layer: 'global' | 'project'): ParsedLayer | null => (
+  layer === 'project' ? model.project : model.global
+);
+
+/** The block the chosen destination currently holds in that layer, if any. */
+const editorOwnAgent = (model: ReadyModel, editor: AgentEditor): PresetAgent | undefined => {
+  const layer = editorLayer(model, editor.target.layer);
+  if (!layer) return undefined;
+  if (editor.target.scope === 'root') {
+    const override = layer.config.rootAgents[editor.agent];
+    return override ? agentFromOverride(editor.agent, override, 'root') : undefined;
+  }
+  return layer.config.presets[editor.presetName]?.find((agent) => agent.agent === editor.agent);
+};
+
+const editorTargetPath = (model: ReadyModel, editor: AgentEditor): string => (
+  editor.target.layer === 'project'
+    ? (model.project?.path ?? PROJECT_PATHS[0])
+    : model.global.path
+);
+
+/**
+ * A global edit is shadowed when the project defines the same agent in the same
+ * scope, because the project layer wins at runtime.
+ */
+const editorIsShadowed = (model: ReadyModel, editor: AgentEditor): boolean => {
+  if (editor.target.layer !== 'global' || !model.project) return false;
+  if (editor.target.scope === 'root') {
+    return Object.hasOwn(model.project.config.rootAgents, editor.agent);
+  }
+  const local = model.project.config.presets[editor.presetName] ?? [];
+  return local.some((agent) => agent.agent === editor.agent);
+};
+
+/** Loads the form from the chosen destination; absent there, from what runs today. */
+const resetEditorDraft = (model: ReadyModel, editor: AgentEditor): void => {
+  const own = editorOwnAgent(model, editor);
+  const effective = model.view.agents.find((agent) => agent.agent === editor.agent);
+  const source = own ?? effective;
+  editor.draft = source
+    ? draftFromAgent(source)
+    : draftFromAgent({ agent: editor.agent, models: [] });
+  editor.pickerMode = null;
+  editor.removeConfirm = false;
   pickerFilter = '';
   pickerAppliedFilter = '';
   if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
+};
+
+const openAgentEditor = (agent: PresetAgent, model: ReadyModel): void => {
+  const origin = model.view.origins[model.view.active.name] ?? 'global';
+  agentEditor = {
+    agent: agent.agent,
+    presetName: model.view.active.name,
+    target: {
+      scope: 'preset',
+      layer: origin === 'project' ? 'project' : 'global',
+    },
+    draft: draftFromAgent(agent),
+    chainOpen: true,
+    advancedOpen: false,
+    pickerMode: null,
+    pickerIndex: 0,
+    removeConfirm: false,
+  };
+  resetEditorDraft(model, agentEditor);
+  pickerFilter = '';
+  pickerAppliedFilter = '';
   if (modelCatalog.length === 0) void fetchModelCatalog();
+  paint();
+  setTimeout(() => {
+    try { root.querySelector<HTMLElement>('.agent-editor')?.focus(); } catch { /* ignore */ }
+  }, 0);
+};
+
+const closeAgentEditor = (): void => {
+  agentEditor = null;
+  pickerFilter = '';
+  pickerAppliedFilter = '';
+  if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
+};
+
+const saveAgentEditor = async (): Promise<void> => {
+  const editor = agentEditor;
+  const model = screen.kind === 'ready' ? screen.model : null;
+  if (!editor || !model) return;
+  const built = patchFromDraft(editor.draft);
+  if (!built.ok) {
+    notice = {
+      tone: 'error',
+      title: t('editorNotSaved'),
+      body: built.error === 'temperature' ? t('editorTemperatureInvalid') : t('editorPermissionInvalid'),
+    };
+    paint();
+    autoDismissNotice(6000);
+    return;
+  }
+  const path = editorTargetPath(model, editor);
+  const target = editor.target.scope === 'root'
+    ? { kind: 'root' as const }
+    : { kind: 'preset' as const, presetName: editor.presetName };
+  try {
+    const file = await readConfigFile(path);
+    if (file.kind === 'failed') throw new Error(file.message);
+    const base = file.kind === 'file' ? file.raw : '';
+    // A missing file (or an empty one) needs a root object; a new project preset
+    // starts as an empty block so the patch lands inside it.
+    const seeded = base.trim()
+      ? base
+      : editor.target.scope === 'root'
+        ? '{}\n'
+        : `${JSON.stringify({ presets: { [editor.presetName]: {} } }, null, 2)}\n`;
+    const next = applyAgentPatchToText(seeded, target, editor.agent, built.patch);
+    await host.writeFile(path, next);
+    closeAgentEditor();
+    await loadAndPaint();
+    notice = { tone: 'success', title: t('editorSaved', editor.agent), body: path };
+    paint();
+    autoDismissNotice(5000);
+  } catch (error) {
+    notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
+    paint();
+    autoDismissNotice(6000);
+  }
+};
+
+const removeAgentFromTarget = async (): Promise<void> => {
+  const editor = agentEditor;
+  const model = screen.kind === 'ready' ? screen.model : null;
+  if (!editor || !model) return;
+  const path = editorTargetPath(model, editor);
+  const target = editor.target.scope === 'root'
+    ? { kind: 'root' as const }
+    : { kind: 'preset' as const, presetName: editor.presetName };
+  try {
+    const file = await readConfigFile(path);
+    if (file.kind !== 'file') throw new Error(t('fileNotFound', path));
+    const next = removeAgentFromText(file.raw, target, editor.agent);
+    await host.writeFile(path, next);
+    closeAgentEditor();
+    await loadAndPaint();
+    notice = { tone: 'success', title: t('editorRemoved', editor.agent) };
+    paint();
+    autoDismissNotice(5000);
+  } catch (error) {
+    notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
+    paint();
+    autoDismissNotice(6000);
+  }
+};
+
+/** Applies a picked model to the chain, either appending or replacing an entry. */
+const applyEditorPick = (picked: string, variant?: string): void => {
+  const editor = agentEditor;
+  if (!editor) return;
+  const ref: PresetModelRef = variant ? { model: picked, variant } : { model: picked };
+  if (editor.pickerMode === 'add-fallback') {
+    // A chain with the same model twice is pointless; keep the first entry.
+    if (!editor.draft.chain.some((entry) => entry.model === picked)) {
+      editor.draft.chain = [...editor.draft.chain, ref];
+    }
+  } else {
+    const index = Math.min(Math.max(editor.pickerIndex, 0), Math.max(editor.draft.chain.length - 1, 0));
+    const chain = [...editor.draft.chain];
+    if (chain.length === 0) chain.push(ref);
+    else chain[index] = ref;
+    editor.draft.chain = chain;
+  }
+  editor.pickerMode = null;
+  pickerFilter = '';
+  pickerAppliedFilter = '';
   paint();
 };
 
-const closeModelPicker = (): void => {
-  modelPicker = null;
-  pickerFilter = '';
-  pickerAppliedFilter = '';
-  if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
-};
-
-const applyPickedModel = async (picked: string, variant?: string): Promise<void> => {
-  if (!modelPicker) return;
-  const { agent, presetName, targetPath } = modelPicker;
-  try {
-    const file = await readConfigFile(targetPath);
-    if (file.kind === 'missing') throw new Error(t('fileNotFound', targetPath));
-    if (file.kind === 'failed') throw new Error(file.message);
-    const next = applyAgentModelToText(file.raw, presetName, agent, picked, variant ?? '');
-    await host.writeFile(targetPath, next);
-    closeModelPicker();
-    await loadAndPaint();
-  } catch (error) {
-    notice = { tone: 'error', title: t('presetNotChanged'), body: errorText(error) };
-    paint();
-    autoDismissNotice(5000);
-  }
-};
 const doClone = async (model: ReadyModel): Promise<void> => {
   if (!cloneState) return;
   const source = cloneState.source;
@@ -1537,9 +2025,9 @@ document.addEventListener('keydown', (event) => {
 // A click listener, not pointerdown: closing must not remove the element the
 // user just pressed before its own click handler runs.
 document.addEventListener('keydown', (event) => {
-  if (!modelPicker) return;
+  if (!agentEditor) return;
   if (event.key === 'Escape') {
-    closeModelPicker();
+    closeAgentEditor();
     paint();
     event.preventDefault();
   }
@@ -1554,8 +2042,8 @@ document.addEventListener('click', (event) => {
     settingsOpen = false;
     paint();
   }
-  if (modelPicker && !target.closest('.model-picker') && !target.closest('.agent-model.is-editable')) {
-    closeModelPicker();
+  if (agentEditor && !target.closest('.agent-editor') && !target.closest('.agent-model.is-editable')) {
+    closeAgentEditor();
     paint();
   }
   if (!listOpen) return;
@@ -1586,6 +2074,7 @@ host.onReady(async (ctx) => {
   applyHostReady(ctx, document.documentElement);
   setLocale(ctx.locale);
   surface = ctx.surface;
+  root.classList.toggle('status-surface', surface === 'status');
   // Bevorzugt die auf der OpenChamber-Settings-Seite gesetzten Werte,
   // sonst der Endpoint-Value aus host.storage (frühere Version).
   const fromSettings = parseWindowHours(ctx.settings?.finishedWindowHours);

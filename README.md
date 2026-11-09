@@ -1,7 +1,7 @@
 # oMo Slim Preset Selector
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![version](https://img.shields.io/badge/version-1.5.17)](package.json)
+[![version](https://img.shields.io/badge/version-1.6.0)](package.json)
 
 An OpenChamber extension that shows the active **oh-my-opencode-slim** preset and switches it — without the TUI and without editing the config by hand.
 
@@ -13,6 +13,8 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 - Dropdown of every preset, with the orchestrator model as a decision hint.
 - Confirmation dialog before every switch; cancelling writes nothing.
 - Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
+- Per-agent editor behind the preset-editing setting: ordered fallback chain with a variant per entry, `inheritModelFrom`, temperature, skills/skills_add/skills_remove, MCPs, permission, display name and color — written to the preset or to the root `agents` map, in either layer.
+- Emergency stop for running subagents, matching the plugin's `/killall` (aborts them and leaves the orchestrator a stop notice).
 - Checks configured models against the effective model catalog and marks missing ones in red.
 - Tracks active and recently finished sessions per agent, with live runtime display.
 - Effective after a Managed Service restart (Settings → Apply & Restart).
@@ -47,6 +49,17 @@ Every switch picks a scope:
 - **This project only** writes `preset` to `.opencode/oh-my-opencode-slim.json`, creating the file (parent directories included) when the project has none. Any preset name from either layer can be selected there, because the project inherits the global `presets` map.
 
 The active row shows the effective preset plus its origin, and a muted hint when a project override shadows a global preset. The `×` next to it clears the project override (only that key) so the global selection applies again.
+
+## Editing an agent
+
+With **Preset editing** enabled, clicking an agent opens its editor. Two independent choices decide what will be written:
+
+- **preset `<active>`** edits that preset's own agent override; **root agents** edits the `agents.<name>` map, which the plugin applies above the active preset.
+- **Global** writes the global config; **This project** writes `.opencode/oh-my-opencode-slim.json` (created when missing).
+
+The form is pre-filled from the chosen destination; when that destination has no block yet, it starts from what runs today so the override can be materialised. The model chain is ordered — first entry is what runs, the rest are fallbacks — and each entry carries its own variant. `Remove` drops the agent from the chosen destination (for a preset that means falling back to the preset inheritance or the built-in default) and asks for a second click.
+
+Status surface note: the editor keeps Advanced collapsed, and the chain and model search scroll inside a capped height.
 
 Preset lists and agent rows reflect the plugin's own resolution: global and project `presets` merge per preset **and per agent**, `presets.<name>.extends` is resolved (with cycle and missing-parent errors reported instead of hiding the panel), and root `agents` overrides are applied above the active preset (marked with a `root` pill).
 
