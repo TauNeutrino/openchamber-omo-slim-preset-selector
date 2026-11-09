@@ -284,20 +284,16 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
   }
   const value = element('span', editable ? 'agent-model is-editable' : 'agent-model');
   if (editable) {
-    value.style.cursor = 'pointer';
     value.addEventListener('click', () => onEdit(agent));
   }
   const model = element('span', 'model-text');
   const primary = primaryModel(agent);
   if (primary) {
-    // Provider part dezent, Modell-ID betont — Split am letzten "/".
+    // Only the model id is shown: the provider prefix did not fit the panel
+    // width and truncated the id itself. The full provider/model chain stays
+    // in the row's title.
     const slash = primary.lastIndexOf('/');
-    if (slash > 0) {
-      model.append(element('span', 'model-provider', primary.slice(0, slash + 1)));
-      model.append(element('span', 'model-content', primary.slice(slash + 1)));
-    } else {
-      model.append(element('span', 'model-content', primary));
-    }
+    model.append(element('span', 'model-content', slash > 0 ? primary.slice(slash + 1) : primary));
   } else {
     // The agent sets no model of its own: it inherits one, or the plugin's
     // default applies. Say so instead of leaving the row blank.
@@ -305,23 +301,25 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
     model.append(element('span', 'model-content is-inherited', label));
   }
   value.append(model);
+  const pills = element('span', 'agent-pills');
   const fallbackCount = Math.max(agent.models.length - 1, 0);
   if (fallbackCount > 0) {
     const fallback = element('span', 'variant fallback-count', `+${fallbackCount}`);
     fallback.title = t('fallbackModels', fallbackCount);
-    value.append(fallback);
+    pills.append(fallback);
   }
   const variant = primaryVariant(agent);
   if (variant) {
     const pill = element('span', 'variant');
     pill.append(element('span', 'model-content', variant));
-    value.append(pill);
+    pills.append(pill);
   }
   if (agent.inheritModelFrom && primary) {
     const inherited = element('span', 'variant', `⇢ ${agent.inheritModelFrom}`);
     inherited.title = t('inheritsFrom', agent.inheritModelFrom);
-    value.append(inherited);
+    pills.append(inherited);
   }
+  if (pills.childElementCount > 0) value.append(pills);
   const chain = agent.models
     .map((ref) => (ref.variant ? `${ref.model} (${ref.variant})` : ref.model))
     .join(' → ');
