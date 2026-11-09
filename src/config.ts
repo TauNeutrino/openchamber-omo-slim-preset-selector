@@ -17,6 +17,14 @@ import {
   type FormattingOptions,
   type ParseError,
 } from 'jsonc-parser';
+import {
+  mergeAgentOverrides,
+  mergePresetMaps,
+  normalizePreset,
+  PresetResolutionError,
+  resolvePresetDefinition,
+  type AgentOverride,
+} from './preset-merge.ts';
 
 /** One entry of a model fallback chain, as the schema allows it. */
 export type PresetModelRef = {
@@ -36,6 +44,8 @@ export type PresetAgent = {
   variant?: string;
   /** The agent takes its model from the session or the orchestrator instead. */
   inheritModelFrom?: 'session' | 'orchestrator';
+  /** The value comes from the root `agents` map, which sits above the preset. */
+  source?: 'root';
 };
 
 /** The model the agent actually runs on, or null when its block sets none. */
@@ -52,8 +62,12 @@ export const primaryVariant = (agent: PresetAgent): string => (
 export type ParsedPresetConfig = {
   /** The `preset` key, trimmed; null when the file does not set one. */
   preset: string | null;
-  /** Valid agent blocks per preset name. Invalid blocks keep their name and an empty list. */
+  /** Agent lists of this layer's preset declarations; `extends` is not applied yet. */
   presets: Record<string, PresetAgent[]>;
+  /** The raw `presets` object of this layer, merged over the other layer's. */
+  presetsRaw: Record<string, unknown>;
+  /** Root `agents` overrides of this layer; they sit above the active preset. */
+  rootAgents: Record<string, AgentOverride>;
   /** All keys of the `presets` map, including blocks without a usable agent. */
   presetNames: string[];
   /** Whether the file carries a `presets` object at all; an empty map counts. */
@@ -81,24 +95,39 @@ export type ActivePreset = {
   origin: PresetLayerKind;
 };
 
+/** Which layers define a preset name. */
+export type PresetOrigin = 'global' | 'project' | 'both';
+
 export type PresetView = {
   active: ActivePreset;
-  /** Effective presets: the project map merged over the global one. */
+  /** The preset each layer selects on its own, before the override wins. */
+  globalPreset: string | null;
+  projectPreset: string | null;
+  /** Each preset's own agents with `extends` resolved, without root overrides. */
   presets: Record<string, PresetAgent[]>;
+  /** The same presets with the root `agents` overrides applied; what the plugin runs. */
+  effective: Record<string, PresetAgent[]>;
+  origins: Record<string, PresetOrigin>;
+  /** Direct `extends` parent of each preset. */
+  parents: Record<string, string | null>;
+  /** Presets that cannot be resolved (cycle, missing parent), by preset name. */
+  errors: Record<string, string>;
   agents: PresetAgent[];
   activePath: string;
+  /** Names defined by each layer, for the scope selector. */
+  globalNames: string[];
+  projectNames: string[];
 };
 
 export type ResolveOutcome =
   | { ok: true; view: PresetView }
   | { ok: false; error: string };
 
-export type WriteTarget = {
-  kind: PresetLayerKind;
-  path: string;
-  /** Names the addressed layer accepts; a project file without its own map inherits the global one. */
-  availableNames: string[];
-};
+export type PresetSwitchScope = 'global' | 'project';
+
+export type SwitchPlan =
+  | { ok: true; scope: PresetSwitchScope; path: string; names: string[] }
+  | { ok: false; code: 'no-project' | 'unknown-preset' | 'not-in-global' | 'empty-preset' | 'broken-preset'; message: string };
 
 const BOM = '\uFEFF';
 
@@ -138,28 +167,45 @@ const modelRefsOf = (value: unknown): PresetModelRef[] => {
   return refs;
 };
 
-const agentsOf = (block: unknown): PresetAgent[] => {
-  if (!isPlainObject(block)) return [];
-  // Newer slim configs wrap the agent map in an `agents` key (next to
-  // `marketplace`); read through that layer when it is present.
-  const map = isPlainObject(block.agents) ? block.agents : block;
+/**
+ * True when an override carries something worth a row: a model, an inheritance
+ * source, or any other agent key (prompt, skills, permission, ...). A block
+ * whose only content is an unusable model stays out.
+ */
+const hasMeaningfulOverride = (override: AgentOverride): boolean => (
+  modelRefsOf(override.model).length > 0
+  || override.inheritModelFrom !== undefined
+  || Object.keys(override).some((key) => key !== 'model')
+);
+
+export const agentFromOverride = (
+  agent: string,
+  override: AgentOverride,
+  source?: 'root',
+): PresetAgent => {
+  const result: PresetAgent = { agent, models: modelRefsOf(override.model) };
+  const variant = nonEmptyString(override.variant);
+  if (variant) result.variant = variant;
+  const inherit = override.inheritModelFrom;
+  if (inherit === 'session' || inherit === 'orchestrator') result.inheritModelFrom = inherit;
+  if (source) result.source = source;
+  return result;
+};
+
+const agentsOfOverrideMap = (
+  map: Record<string, AgentOverride>,
+  rootOverrides?: Record<string, AgentOverride>,
+): PresetAgent[] => {
   const agents: PresetAgent[] = [];
-  for (const [agent, value] of Object.entries(map)) {
-    if (!isPlainObject(value)) continue;
-    const models = modelRefsOf(value.model);
-    const inherits = nonEmptyString(value.inheritModelFrom);
-    const inheritModelFrom = inherits === 'session' || inherits === 'orchestrator' ? inherits : undefined;
-    // A block without a model reference is not an agent row: in the legacy
-    // flat form it would otherwise surface keys like `marketplace` as agents.
-    if (models.length === 0 && !inheritModelFrom) continue;
-    const entry: PresetAgent = { agent, models };
-    const variant = nonEmptyString(value.variant);
-    if (variant) entry.variant = variant;
-    if (inheritModelFrom) entry.inheritModelFrom = inheritModelFrom;
-    agents.push(entry);
+  for (const [agent, override] of Object.entries(map)) {
+    if (!isPlainObject(override) || !hasMeaningfulOverride(override)) continue;
+    const fromRoot = rootOverrides !== undefined && Object.hasOwn(rootOverrides, agent);
+    agents.push(agentFromOverride(agent, override, fromRoot ? 'root' : undefined));
   }
   return agents;
 };
+
+const agentsOf = (block: unknown): PresetAgent[] => agentsOfOverrideMap(normalizePreset(block).agents);
 
 /**
  * Parses one preset file. A missing file is the caller's concern; anything
@@ -167,12 +213,18 @@ const agentsOf = (block: unknown): PresetAgent[] => {
  * would let a write replace content that could not be understood.
  */
 export const parseConfigText = (raw: string, label: string): ParseOutcome => {
+  const emptyConfig = (): ParsedPresetConfig => ({
+    preset: null,
+    presets: {},
+    presetsRaw: {},
+    rootAgents: {},
+    presetNames: [],
+    hasPresets: false,
+    commentOnly: true,
+  });
   const content = raw.startsWith(BOM) ? raw.slice(1) : raw;
   if (!content.trim()) {
-    return {
-      ok: true,
-      config: { preset: null, presets: {}, presetNames: [], hasPresets: false, commentOnly: true },
-    };
+    return { ok: true, config: emptyConfig() };
   }
 
   const errors: ParseError[] = [];
@@ -180,10 +232,7 @@ export const parseConfigText = (raw: string, label: string): ParseOutcome => {
   const commentOnly = parsed === undefined
     && errors.every((entry) => printParseErrorCode(entry.error) === 'ValueExpected');
   if (commentOnly) {
-    return {
-      ok: true,
-      config: { preset: null, presets: {}, presetNames: [], hasPresets: false, commentOnly: true },
-    };
+    return { ok: true, config: emptyConfig() };
   }
   if (errors.length > 0) {
     const first = errors[0];
@@ -205,6 +254,7 @@ export const parseConfigText = (raw: string, label: string): ParseOutcome => {
   }
 
   let presets: Record<string, PresetAgent[]> = {};
+  let presetsRaw: Record<string, unknown> = {};
   let presetNames: string[] = [];
   let hasPresets = false;
   if (Object.prototype.hasOwnProperty.call(parsed, 'presets')) {
@@ -213,15 +263,27 @@ export const parseConfigText = (raw: string, label: string): ParseOutcome => {
       return { ok: false, error: `In ${label} ist "presets" kein Objekt.` };
     }
     hasPresets = true;
+    presetsRaw = value;
     presetNames = Object.keys(value);
     presets = Object.fromEntries(
       presetNames.map((name) => [name, agentsOf(value[name])]),
     );
   }
 
+  const rootAgents: Record<string, AgentOverride> = {};
+  if (Object.prototype.hasOwnProperty.call(parsed, 'agents')) {
+    const value = parsed.agents;
+    if (!isPlainObject(value)) {
+      return { ok: false, error: `In ${label} ist "agents" kein Objekt.` };
+    }
+    for (const [agent, entry] of Object.entries(value)) {
+      if (isPlainObject(entry)) rootAgents[agent] = entry as AgentOverride;
+    }
+  }
+
   return {
     ok: true,
-    config: { preset, presets, presetNames, hasPresets, commentOnly: false },
+    config: { preset, presets, presetsRaw, rootAgents, presetNames, hasPresets, commentOnly: false },
   };
 };
 
@@ -286,106 +348,154 @@ export const applyPresetToText = (raw: string, name: string): string => {
   return hasBom ? `${BOM}${next}` : next;
 };
 
-const definedPresets = (
-  global: ParsedLayer,
-  project: ParsedLayer | null,
-): Record<string, PresetAgent[]> => (
-  project?.config.hasPresets
-    ? { ...global.config.presets, ...project.config.presets }
-    : global.config.presets
-);
-
-const writeNamesFor = (
-  global: ParsedLayer,
-  project: ParsedLayer | null,
-): { kind: PresetLayerKind; path: string; availableNames: string[] } => {
-  if (project?.config.preset) {
-    // A project override may only change the active preset and inherit the
-    // global map; when it defines its own map, that map decides.
-    return {
-      kind: 'project',
-      path: project.path,
-      availableNames: project.config.hasPresets
-        ? project.config.presetNames
-        : global.config.presetNames,
-    };
-  }
-  return { kind: 'global', path: global.path, availableNames: global.config.presetNames };
-};
-
 /**
- * Decides which preset is in force, which agents it configures, and which
- * layer a switch would write. The project override wins whenever it sets a
- * preset, exactly like the oh-my-opencode-slim merge.
+ * Builds the cross-layer picture the panel shows: which preset each layer
+ * selects, which names exist (merged per preset and agent, like the plugin),
+ * each preset's resolved agents with `extends`, and the root `agents` overlay
+ * that sits above the active preset. A preset that cannot be resolved (cycle,
+ * missing parent) keeps an empty list and an entry in `errors` — it must never
+ * make the whole panel unreadable.
  */
 export const resolvePresetView = (
   global: ParsedLayer,
   project: ParsedLayer | null,
 ): ResolveOutcome => {
-  const presets = definedPresets(global, project);
-  const target = writeNamesFor(global, project);
+  const merged = mergePresetMaps(global.config.presetsRaw, project?.config.presetsRaw ?? null);
+  const names = Object.keys(merged);
+  const globalNames = Object.keys(global.config.presetsRaw);
+  const projectNames = project ? Object.keys(project.config.presetsRaw) : [];
   const projectPreset = project?.config.preset ?? null;
+  const globalPreset = global.config.preset;
+  const activeName = projectPreset ?? globalPreset;
 
-  if (projectPreset) {
-    if (!target.availableNames.includes(projectPreset)) {
-      return {
-        ok: false,
-        error: `Preset "${projectPreset}" ist in ${target.path} nicht definiert.`,
-      };
-    }
-    return {
-      ok: true,
-      view: {
-        active: { name: projectPreset, origin: 'project' },
-        presets,
-        agents: presets[projectPreset] ?? [],
-        activePath: target.path,
-      },
-    };
-  }
-
-  if (!global.config.preset) {
+  if (!activeName) {
     return { ok: false, error: `In ${global.path} ist kein Preset gesetzt.` };
   }
-  if (!target.availableNames.includes(global.config.preset)) {
-    return {
-      ok: false,
-      error: `Preset "${global.config.preset}" ist in ${target.path} nicht definiert.`,
-    };
+  if (!Object.hasOwn(merged, activeName)) {
+    const where = projectPreset ? (project?.path ?? global.path) : global.path;
+    return { ok: false, error: `Preset "${activeName}" ist in ${where} nicht definiert.` };
   }
+
+  const origins: Record<string, PresetOrigin> = {};
+  for (const name of names) {
+    const inGlobal = globalNames.includes(name);
+    const inProject = projectNames.includes(name);
+    origins[name] = inGlobal && inProject ? 'both' : inProject ? 'project' : 'global';
+  }
+
+  // Root `agents` merge over each other and then over the resolved preset;
+  // agents that appear there are tagged so the row can say where it came from.
+  const rootOverrides = mergeAgentOverrides(global.config.rootAgents, project?.config.rootAgents ?? {});
+
+  const presets: Record<string, PresetAgent[]> = {};
+  const effective: Record<string, PresetAgent[]> = {};
+  const parents: Record<string, string | null> = {};
+  const errors: Record<string, string> = {};
+  for (const name of names) {
+    try {
+      const definition = resolvePresetDefinition(name, merged);
+      parents[name] = definition.extends ?? null;
+      presets[name] = agentsOfOverrideMap(definition.agents);
+      effective[name] = agentsOfOverrideMap(
+        mergeAgentOverrides(definition.agents, rootOverrides),
+        rootOverrides,
+      );
+    } catch (error) {
+      presets[name] = [];
+      effective[name] = [];
+      parents[name] = null;
+      errors[name] = error instanceof PresetResolutionError || error instanceof Error
+        ? error.message
+        : String(error);
+    }
+  }
+
   return {
     ok: true,
     view: {
-      active: { name: global.config.preset, origin: 'global' },
+      active: { name: activeName, origin: projectPreset ? 'project' : 'global' },
+      globalPreset,
+      projectPreset,
       presets,
-      agents: presets[global.config.preset] ?? [],
-      activePath: target.path,
+      effective,
+      origins,
+      parents,
+      errors,
+      agents: effective[activeName] ?? [],
+      activePath: projectPreset ? (project?.path ?? global.path) : global.path,
+      globalNames,
+      projectNames,
     },
   };
 };
 
 /**
- * The layer a switch writes, derived from the preset in force. Returns the
- * names that layer accepts so the caller can refuse an unknown preset without
- * touching the file.
+ * Plans a preset switch for an explicit scope. The project layer may reference
+ * any merged preset name (it inherits the global map); the global layer can only
+ * select presets it defines itself. Mirrors the plugin's refusal to select an
+ * empty preset or one whose inheritance cannot be resolved.
  */
-export const resolveWriteTarget = (global: ParsedLayer, project: ParsedLayer | null, name?: string): WriteTarget => {
-  // A preset that only exists in the project layer must be written there.
-  if (name && project?.config.hasPresets && project.config.presetNames.includes(name)) {
-    return { kind: 'project', path: project.path, availableNames: project.config.presetNames };
+export const planPresetSwitch = (args: {
+  scope: PresetSwitchScope;
+  name: string;
+  /** Target path for the project layer; null when no project is open. */
+  projectPath: string | null;
+  global: ParsedLayer;
+  project: ParsedLayer | null;
+}): SwitchPlan => {
+  const { scope, name, projectPath, global, project } = args;
+  if (scope === 'project' && !projectPath) {
+    return { ok: false, code: 'no-project', message: t('noProjectOpen') };
   }
-  // A preset that only exists in the global layer must be written there, even
-  // when the project currently overrides the active preset.
-  if (name && global.config.presetNames.includes(name)
-    && !(project?.config.hasPresets && project.config.presetNames.includes(name))) {
-    return { kind: 'global', path: global.path, availableNames: global.config.presetNames };
-  }
-  return writeNamesFor(global, project);
-};
 
-export const writeTargetAccepts = (target: WriteTarget, name: string): boolean => (
-  target.availableNames.includes(name)
-);
+  const merged = mergePresetMaps(global.config.presetsRaw, project?.config.presetsRaw ?? null);
+  const globalNames = Object.keys(global.config.presetsRaw);
+  const names = scope === 'global' ? globalNames : Object.keys(merged);
+
+  if (scope === 'global' && !globalNames.includes(name)) {
+    const projectOnly = project ? Object.keys(project.config.presetsRaw).includes(name) : false;
+    return {
+      ok: false,
+      code: 'not-in-global',
+      message: projectOnly
+        ? `Preset "${name}" ist nur im Projekt definiert; global wäre es nicht sichtbar.`
+        : `Preset "${name}" ist in ${global.path} nicht definiert.`,
+    };
+  }
+  if (!names.includes(name)) {
+    const where = projectPath ?? global.path;
+    return {
+      ok: false,
+      code: 'unknown-preset',
+      message: `Preset "${name}" ist in ${where} nicht definiert.`,
+    };
+  }
+
+  let definition;
+  try {
+    definition = resolvePresetDefinition(name, merged);
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'broken-preset',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (Object.keys(definition.agents).length === 0 && definition.marketplace === undefined) {
+    return {
+      ok: false,
+      code: 'empty-preset',
+      message: `Preset "${name}" ist leer (keine Agent-Overrides).`,
+    };
+  }
+
+  return {
+    ok: true,
+    scope,
+    path: scope === 'project' ? (projectPath as string) : global.path,
+    names,
+  };
+};
 
 /** The agent that every preset configures, used as the dropdown's one-line hint. */
 export const orchestratorModel = (
@@ -418,8 +528,13 @@ export const clearPresetFromText = (raw: string): string => {
   return hasBom ? `${BOM}${next}` : next;
 };
 
+/**
+ * Adds a preset below `presets`. With `extendsName` the new block keeps the
+ * structured form (`{ extends, agents }`) so the inheritance survives; without
+ * it the flat agent map stays, as before.
+ */
 export const addPresetToText = (
-  raw: string, name: string, agents: PresetAgent[],
+  raw: string, name: string, agents: PresetAgent[], extendsName: string | null = null,
 ): string => {
   const nextName = name.trim();
   if (!nextName) throw new Error(t('presetNameEmpty'));
@@ -445,14 +560,15 @@ export const addPresetToText = (
     if (a.inheritModelFrom) block.inheritModelFrom = a.inheritModelFrom;
     agentObj[a.agent] = block;
   }
+  const presetBody: unknown = extendsName ? { extends: extendsName, agents: agentObj } : agentObj;
 
   let next: string;
   if (before.config.commentOnly || !before.config.hasPresets) {
     const prefix = content.trimEnd();
-    const body = JSON.stringify({ presets: { [nextName]: agentObj } }, null, fmt.tabSize || 2);
+    const body = JSON.stringify({ presets: { [nextName]: presetBody } }, null, fmt.tabSize || 2);
     next = `${prefix ? `${prefix}${fmt.eol}` : ''}${body}${fmt.eol}`;
   } else {
-    const edits = modify(content, ['presets', nextName], agentObj, { formattingOptions: fmt });
+    const edits = modify(content, ['presets', nextName], presetBody, { formattingOptions: fmt });
     next = applyEdits(content, edits);
   }
 

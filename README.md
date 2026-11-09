@@ -8,7 +8,8 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 ![Screenshot](assets/screenshot.png)
 
 - Panel on the right rail and a section in the Work Status panel.
-- Shows the active preset, its origin (`Global` / `Project`), and the agent→model mapping of the active preset — including fallback chains (`model` arrays) and agents that inherit their model.
+- Shows the active preset, its origin (`Global` / `Project`), and the agent→model mapping of the active preset — including fallback chains (`model` arrays), `extends` inheritance and agents that inherit their model.
+- **Switches explicitly per scope**: apply a preset globally, or only for the open project — with the file that will be written shown before you confirm.
 - Dropdown of every preset, with the orchestrator model as a decision hint.
 - Confirmation dialog before every switch; cancelling writes nothing.
 - Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
@@ -37,6 +38,17 @@ Web and desktop clients are supported. The phone app and VS Code do not load ext
 | Project override | `.opencode/oh-my-opencode-slim.json`, else `.jsonc` |
 
 The project map is merged over the global one; the active preset's origin badge shows which layer it comes from.
+
+## Global vs project
+
+Every switch picks a scope:
+
+- **Apply globally** writes `preset` to the global file. It changes the default for every project and does **not** take effect where a project override is set — the panel warns about that before writing and offers to clear the override in the same action.
+- **This project only** writes `preset` to `.opencode/oh-my-opencode-slim.json`, creating the file (parent directories included) when the project has none. Any preset name from either layer can be selected there, because the project inherits the global `presets` map.
+
+The active row shows the effective preset plus its origin, and a muted hint when a project override shadows a global preset. The `×` next to it clears the project override (only that key) so the global selection applies again.
+
+Preset lists and agent rows reflect the plugin's own resolution: global and project `presets` merge per preset **and per agent**, `presets.<name>.extends` is resolved (with cycle and missing-parent errors reported instead of hiding the panel), and root `agents` overrides are applied above the active preset (marked with a `root` pill).
 
 ## Model check
 

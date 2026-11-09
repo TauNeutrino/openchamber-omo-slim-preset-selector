@@ -15,16 +15,15 @@ import {
   clearPresetFromText,
   orchestratorModel,
   parseConfigText,
+  planPresetSwitch,
   primaryModel,
   primaryVariant,
   resolvePresetView,
-  resolveWriteTarget,
   sortedPresetNames,
-  writeTargetAccepts,
   type ParsedLayer,
   type PresetAgent,
+  type PresetSwitchScope,
   type PresetView,
-  type WriteTarget,
 } from './config.ts';
 import { countGlyph, groupAgentSessions, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
 import { setLocale, t } from './i18n.ts';
@@ -60,8 +59,9 @@ type Screen =
 
 type Interaction =
   | { kind: 'browse' }
-  | { kind: 'confirm'; name: string }
-  | { kind: 'applying'; name: string }
+  | { kind: 'confirm'; name: string; scope: PresetSwitchScope; clearProjectOverride: boolean }
+  | { kind: 'applying'; name: string; scope: PresetSwitchScope }
+  | { kind: 'busy' }
   | { kind: 'confirm-model-switch'; sessionId: string; model: string; presetName: string };
 
 type LayersRead =
@@ -321,6 +321,11 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
     inherited.title = t('inheritsFrom', agent.inheritModelFrom);
     pills.append(inherited);
   }
+  if (agent.source === 'root') {
+    const root = element('span', 'variant', 'root');
+    root.title = t('rootOverride');
+    pills.append(root);
+  }
   if (pills.childElementCount > 0) value.append(pills);
   const chain = agent.models
     .map((ref) => (ref.variant ? `${ref.model} (${ref.variant})` : ref.model))
@@ -420,6 +425,16 @@ const openSession = (id: string): void => {
   });
 };
 
+const defaultScopeFor = (model: ReadyModel, name: string): PresetSwitchScope => {
+  if (!directory) return 'global';
+  const origin = model.view.origins[name];
+  if (origin === 'project' || origin === 'both') return 'project';
+  // Stay in the layer that already decides here, instead of silently making a
+  // global change the project override would mask.
+  if (model.view.projectPreset) return 'project';
+  return 'global';
+};
+
 const paintPresetList = (parent: Element, model: ReadyModel, busy: boolean): void => {
   const names = sortedPresetNames(model.view.presets);
   const list = element('div', 'preset-list');
@@ -429,25 +444,42 @@ const paintPresetList = (parent: Element, model: ReadyModel, busy: boolean): voi
 
   for (const name of names) {
     const active = name === model.view.active.name;
+    const broken = model.view.errors[name];
     const option = element('button', 'preset-option');
     option.type = 'button';
     option.setAttribute('role', 'option');
     option.setAttribute('aria-selected', active ? 'true' : 'false');
     option.dataset.active = active ? 'true' : 'false';
-    option.disabled = busy;
+    option.disabled = busy || broken !== undefined;
+    if (broken) option.title = broken;
 
     const label = element('span', 'option-label');
     label.append(element('span', 'option-name', name));
-    const hint = orchestratorModel(model.view.presets, name);
+    const hint = orchestratorModel(model.view.effective, name);
     if (hint) label.append(element('span', 'option-model', hint));
+    const meta = element('span', 'option-meta');
+    if (!active && model.view.active.origin === 'project' && name === model.view.globalPreset) {
+      meta.append(element('span', 'option-marker is-global-default', t('globalDefaultMarker')));
+    }
+    const parentName = model.view.parents[name];
+    if (parentName) meta.append(element('span', 'option-extends', `↳ ${parentName}`));
+    if (broken) {
+      const marker = element('span', 'option-marker', '⚠');
+      marker.title = broken;
+      meta.append(marker);
+    }
+    if (meta.childElementCount > 0) label.append(meta);
     option.append(label);
-    const inProject = !!model.project?.config.hasPresets && (model.project.config.presetNames?.includes(name) ?? false);
-    const origin = inProject ? 'project' : 'global';
-    const badge = element('span', 'origin-badge', origin === 'project' ? t('projectLayer') : t('globalLayer'));
+
+    const origin = model.view.origins[name] ?? 'global';
+    const badge = element('span', 'origin-badge', origin === 'both'
+      ? t('bothLayers')
+      : origin === 'project' ? t('projectLayer') : t('globalLayer'));
     if (origin === 'project') badge.classList.add('is-project');
+    if (origin === 'both') badge.classList.add('is-mixed');
     option.append(badge);
     if (active) option.append(element('span', 'option-check', '✓'));
-    if (presetEditingEnabled) {
+    if (presetEditingEnabled && !broken) {
       const cloneBtn = element('button', 'clone-btn', '🗐');
       cloneBtn.type = 'button';
       cloneBtn.title = t('clonePreset');
@@ -465,7 +497,12 @@ const paintPresetList = (parent: Element, model: ReadyModel, busy: boolean): voi
         paint();
         return;
       }
-      interaction = { kind: 'confirm', name };
+      interaction = {
+        kind: 'confirm',
+        name,
+        scope: defaultScopeFor(model, name),
+        clearProjectOverride: false,
+      };
       paint();
       const card = root.querySelector<HTMLElement>('.confirm');
       card?.focus();
@@ -487,10 +524,23 @@ const paintTrigger = (parent: Element, model: ReadyModel, busy: boolean): void =
   trigger.disabled = busy;
   trigger.title = t('switchPreset');
   trigger.append(element('span', 'preset-name', model.view.active.name));
+  const scope = element('span', 'scope-control');
   const originBadge = element('span', 'origin-badge', model.view.active.origin === 'project' ? t('projectLayer') : t('globalLayer'));
   originBadge.style.pointerEvents = 'none';
   if (model.view.active.origin === 'project') originBadge.classList.add('is-project');
-  trigger.append(originBadge);
+  scope.append(originBadge);
+  if (model.view.projectPreset) {
+    const hintText = model.view.globalPreset
+      ? (model.view.globalPreset === model.view.active.name
+        ? t('sameAsGlobal')
+        : t('globalShadowed', model.view.globalPreset))
+      : t('noGlobalPreset');
+    const hint = element('span', 'scope-hint');
+    hint.append(element('span', 'scope-hint-text', hintText));
+    if (globalThis.matchMedia?.('(hover: hover)').matches) hint.title = hintText;
+    scope.append(hint);
+  }
+  trigger.append(scope);
   trigger.append(element('span', 'chevron', listOpen ? '▴' : '▾'));
   trigger.addEventListener('click', () => {
     listOpen = !listOpen;
@@ -518,7 +568,16 @@ const modelIsMissing = (audit: ModelAudit | null, agent: PresetAgent): boolean =
 );
 
 const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
-  const busy = interaction.kind === 'applying';
+  const busy = interaction.kind === 'applying' || interaction.kind === 'busy';
+
+  const activeError = model.view.errors[model.view.active.name];
+  if (activeError) {
+    mounted.push(mountBanner(panel, {
+      tone: 'error',
+      title: t('presetBrokenTitle', model.view.active.name),
+      body: activeError,
+    }));
+  }
 
   if (modelCheck.kind === 'done') paintMissingModelsBanner(panel, modelCheck.audit);
 
@@ -564,14 +623,20 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
   }
   if (interaction.kind === 'confirm' || interaction.kind === 'applying') {
     const name = interaction.name;
-    const target = resolveWriteTarget(model.global, model.project);
+    const scope: PresetSwitchScope = interaction.scope;
+    const projectPath = model.project?.path ?? (directory ? PROJECT_PATHS[0] : null);
+    const inGlobal = model.view.globalNames.includes(name);
+    const globalDisabled = !inGlobal;
+    const projectDisabled = projectPath === null;
+    const targetPath = scope === 'project' ? (projectPath ?? PROJECT_PATHS[0]) : model.global.path;
+
     const card = element('div', 'confirm');
     card.tabIndex = -1;
     card.setAttribute('role', 'group');
     card.setAttribute('aria-label', `${t('apply')} ${name}`);
     card.append(element('div', 'confirm-title', t('applyPresetTitle', name)));
     const body = element('div', 'confirm-body');
-    const bodyText = t('applyPresetBody', target.path);
+    const bodyText = t('applyPresetBody', targetPath);
     const presetIdx = bodyText.indexOf('preset');
     if (presetIdx >= 0) {
       body.append(document.createTextNode(bodyText.slice(0, presetIdx)));
@@ -581,6 +646,50 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
       body.append(document.createTextNode(bodyText));
     }
     card.append(body);
+
+    // Explicit scope: the same preset name is meaningful in both layers, and
+    // which one changes is the user's call.
+    const scopeRow = element('div', 'confirm-scope');
+    const makeChoice = (choice: PresetSwitchScope, label: string, disabled: boolean): HTMLElement => {
+      const button = element('button', 'scope-choice', label);
+      button.type = 'button';
+      button.setAttribute('aria-pressed', String(scope === choice));
+      if (scope === choice) button.classList.add('is-selected');
+      if (disabled) {
+        button.classList.add('is-disabled');
+        button.disabled = true;
+      }
+      button.addEventListener('click', () => {
+        if (disabled || interaction.kind === 'applying') return;
+        interaction = { kind: 'confirm', name, scope: choice, clearProjectOverride: false };
+        paint();
+      });
+      return button;
+    };
+    scopeRow.append(makeChoice('global', t('applyGlobally'), globalDisabled));
+    scopeRow.append(makeChoice('project', t('applyToProject'), projectDisabled));
+    if (globalDisabled) scopeRow.append(element('p', 'confirm-scope-note', t('scopeNotGlobal', name)));
+    else if (projectDisabled) scopeRow.append(element('p', 'confirm-scope-note', t('scopeNoProject')));
+    card.append(scopeRow);
+
+    const overrideName = model.view.projectPreset;
+    if (scope === 'global' && overrideName && overrideName !== name) {
+      const warning = element('div', 'confirm-warning');
+      warning.append(element('div', 'confirm-warning-text', t('globalOverrideWarning', overrideName)));
+      const checkRow = element('label', 'confirm-checkbox-row');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = interaction.kind === 'confirm' && interaction.clearProjectOverride;
+      checkbox.disabled = busy || !model.project;
+      checkbox.addEventListener('change', () => {
+        if (interaction.kind !== 'confirm') return;
+        interaction = { ...interaction, clearProjectOverride: checkbox.checked };
+      });
+      checkRow.append(checkbox, element('span', '', t('alsoClearOverride')));
+      warning.append(checkRow);
+      card.append(warning);
+    }
+
     card.append(element('div', 'confirm-hint', restartHint()));
 
     const actions = element('div', 'confirm-actions');
@@ -598,7 +707,10 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
       label: t('apply'),
       size: 'sm',
       loading: busy,
-      onClick: () => { void applyPreset(name); },
+      onClick: () => {
+        const clear = interaction.kind === 'confirm' ? interaction.clearProjectOverride : false;
+        void applyPreset(name, scope, clear);
+      },
     }));
     card.append(actions);
     panel.append(card);
@@ -607,6 +719,18 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
 
   const activeRow = element('div', 'active-row');
   paintTrigger(activeRow, model, busy);
+  if (model.view.projectPreset) {
+    const clear = element('button', 'icon-btn clear-override', '×');
+    clear.type = 'button';
+    const hint = model.view.globalPreset
+      ? t('clearOverrideHint', model.view.globalPreset)
+      : t('clearOverride');
+    clear.title = hint;
+    clear.setAttribute('aria-label', hint);
+    clear.disabled = busy;
+    clear.addEventListener('click', () => { void clearProjectOverride(); });
+    activeRow.append(clear);
+  }
   // Refresh (↻) direkt neben dem Preset-Selektor statt einer Eyebrow-Zeile oben.
   const refresh = element('button', 'icon-btn', '↻');
   refresh.type = 'button';
@@ -1017,10 +1141,9 @@ const fetchModelCatalog = async (): Promise<void> => {
 const openModelPicker = (agent: PresetAgent, model: ReadyModel): void => {
   const project = model.project;
   const global = model.global;
+  const origin = model.view.origins[model.view.active.name] ?? 'global';
   let targetPath = global.path;
-  if (project?.config.hasPresets && project.config.presetNames.includes(model.view.active.name)) {
-    targetPath = project.path;
-  }
+  if (project && (origin === 'project' || origin === 'both')) targetPath = project.path;
   modelPicker = {
     agent: agent.agent,
     presetName: model.view.active.name,
@@ -1066,7 +1189,15 @@ const doClone = async (model: ReadyModel): Promise<void> => {
   const trimmed = cloneState.name.trim();
   if (!trimmed || !scope) return;
   const agents = model.view.presets[source] ?? [];
-  if (agents.length === 0) {
+  // Clone the preset's own declaration, not the root overlay; keep `extends`
+  // when the parent will be visible in the target layer.
+  const parent = model.view.parents[source];
+  const visibleParent = parent && (
+    scope === 'global'
+      ? model.view.globalNames.includes(parent)
+      : model.view.globalNames.includes(parent) || model.view.projectNames.includes(parent)
+  ) ? parent : null;
+  if (agents.length === 0 && !visibleParent) {
     notice = { tone: 'error', title: t('presetNotChanged'), body: t('noAgentsConfigured') };
     paint();
     autoDismissNotice(5000);
@@ -1078,7 +1209,7 @@ const doClone = async (model: ReadyModel): Promise<void> => {
   try {
     const file = await readConfigFile(targetPath);
     const raw = file.kind === 'file' ? file.raw : '';
-    const next = addPresetToText(raw, trimmed, agents);
+    const next = addPresetToText(raw, trimmed, agents, visibleParent);
     await host.writeFile(targetPath, next);
     cloneState = null;
     notice = { tone: 'success', title: t('cloneSuccess', trimmed), body: targetPath };
@@ -1092,12 +1223,9 @@ const doClone = async (model: ReadyModel): Promise<void> => {
   }
 };
 
-const auditRefsFor = (view: PresetView, project: ParsedLayer | null): string[] => collectModelRefs(
+const auditRefsFor = (view: PresetView): string[] => collectModelRefs(
   view.agents,
-  [
-    view.active.name && view.presets[view.active.name] ? view.presets[view.active.name] : null,
-    project && project.config.preset && view.presets[project.config.preset] ? view.presets[project.config.preset] : null,
-  ],
+  [view.effective[view.active.name] ?? null],
 );
 
 const loadAndPaint = async (): Promise<void> => {
@@ -1136,12 +1264,12 @@ const loadAndPaint = async (): Promise<void> => {
     },
   };
   paint();
-  refreshModelCheck(auditRefsFor(resolved.view, layers.project));
+  refreshModelCheck(auditRefsFor(resolved.view));
 };
 
 const switchSessionModel = async (sessionId: string, model: string): Promise<void> => {
   const freshId = currentSessionId ?? sessionId;
-  interaction = { kind: 'applying', name: t('modelSwitching') };
+  interaction = { kind: 'busy' };
   paint();
   try {
     const result = await host.serviceRequest({ method: 'POST', path: '/switch-model', body: JSON.stringify({ sessionId: freshId, model }) });
@@ -1166,20 +1294,46 @@ const switchSessionModel = async (sessionId: string, model: string): Promise<voi
   }
 };
 
-const applyPreset = async (name: string): Promise<void> => {
+/**
+ * Removes the project's `preset` override so the global selection takes effect
+ * again. Only that key is touched; the project's own presets stay.
+ */
+const clearProjectOverride = async (): Promise<void> => {
+  const model = screen.kind === 'ready' ? screen.model : null;
+  if (!model?.project) return;
+  try {
+    const file = await readConfigFile(model.project.path);
+    if (file.kind !== 'file') throw new Error(t('fileNotFound', model.project.path));
+    await host.writeFile(model.project.path, clearPresetFromText(file.raw));
+    await loadAndPaint();
+    notice = { tone: 'success', title: t('overrideCleared'), body: model.project.path };
+    paint();
+    autoDismissNotice(5000);
+    void host.toast({ kind: 'success', message: t('overrideCleared') });
+  } catch (error) {
+    notice = { tone: 'error', title: t('presetNotChanged'), body: errorText(error) };
+    paint();
+    autoDismissNotice(5000);
+  }
+};
+
+const applyPreset = async (
+  name: string,
+  scope: PresetSwitchScope,
+  clearOverride: boolean,
+): Promise<void> => {
   if (interaction.kind === 'applying') return;
   const model = screen.kind === 'ready' ? screen.model : null;
   if (!model) return;
 
-  interaction = { kind: 'applying', name };
+  interaction = { kind: 'applying', name, scope };
   notice = null;
   paint();
 
-  const expected = resolveWriteTarget(model.global, model.project, name);
   const startDirectory = directory;
 
   // Re-read before writing: a concurrent edit must not be overwritten with a
-  // stale copy, and the layer in force must still be the one the user confirmed.
+  // stale copy.
   const layers = await readLayers(directory);
   if (layers.status === 'failed') {
     interaction = { kind: 'browse' };
@@ -1198,33 +1352,6 @@ const applyPreset = async (name: string): Promise<void> => {
     paint();
     return;
   }
-
-  const target: WriteTarget = resolveWriteTarget(layers.global, layers.project, name);
-  // Switching to a project-only preset legitimately moves the write target
-  // from the global layer to the project layer; that is not a concurrent edit.
-  const layerChanged = target.kind !== expected.kind && !(expected.kind === 'global' && target.kind === 'project' && target.availableNames.includes(name));
-  if (layerChanged) {
-    interaction = { kind: 'browse' };
-    notice = {
-      tone: 'error',
-      title: t('presetNotChanged'),
-      body: t('activeLayerChanged'),
-    };
-    screen = { kind: 'ready', model: { ...model, global: layers.global, project: layers.project, view: resolved.view } };
-    paint();
-    return;
-  }
-  if (!writeTargetAccepts(target, name)) {
-    interaction = { kind: 'browse' };
-    notice = {
-      tone: 'error',
-      title: t('presetNotChanged'),
-      body: t('presetNotDefined', name, target.path),
-    };
-    screen = { kind: 'ready', model: { ...model, global: layers.global, project: layers.project, view: resolved.view } };
-    paint();
-    return;
-  }
   if (directory !== startDirectory) {
     interaction = { kind: 'browse' };
     notice = {
@@ -1237,42 +1364,46 @@ const applyPreset = async (name: string): Promise<void> => {
     return;
   }
 
-  const source = target.kind === 'project' ? layers.project : layers.global;
-  if (!source) {
+  const projectPath = layers.project?.path ?? (directory ? PROJECT_PATHS[0] : null);
+  const plan = planPresetSwitch({
+    scope,
+    name,
+    projectPath,
+    global: layers.global,
+    project: layers.project,
+  });
+  if (!plan.ok) {
     interaction = { kind: 'browse' };
-    screen = {
-      kind: 'failed',
-      title: t('presetNotChanged'),
-      detail: `${target.path} wurde nicht gefunden.`,
-    };
+    notice = { tone: 'error', title: t('presetNotChanged'), body: plan.message };
+    screen = { kind: 'ready', model: { ...model, global: layers.global, project: layers.project, view: resolved.view } };
     paint();
+    autoDismissNotice(7000);
     return;
   }
 
   try {
-    const next = applyPresetToText(source.raw, name);
-    await host.writeFile(target.path, next);
-    // Wenn auf ein globales Preset gewechselt wird und das Projekt vorher
-    // ein eigenes Preset überschrieben hat, den Projekt-Override entfernen,
-    // damit das globale Preset wirksam wird.
-    if (target.kind === 'global' && layers.project?.config.preset) {
+    // A project layer may not have a config file yet; the empty text is the
+    // comment-only case, which applyPresetToText turns into a fresh root object.
+    const targetLayer = scope === 'project' ? layers.project : layers.global;
+    const next = applyPresetToText(targetLayer?.raw ?? '', name);
+    await host.writeFile(plan.path, next);
+    // Switching globally while the project overrides the preset leaves the
+    // project in charge; only clear it when the user asked for that.
+    if (scope === 'global' && clearOverride && layers.project?.config.preset) {
       try {
         const projFile = await readConfigFile(layers.project.path);
         if (projFile.kind === 'file') {
-          const cleared = clearPresetFromText(projFile.raw);
-          await host.writeFile(layers.project.path, cleared);
+          await host.writeFile(layers.project.path, clearPresetFromText(projFile.raw));
         }
-      } catch { /* ignore */ }
+      } catch { /* best effort: the global switch landed */ }
     }
     // Neues Orchestrator-Modell aus dem gewählten Preset ermitteln.
-    const newOrchestratorModel = orchestratorModel(model.view.presets, name);
-    notice = {
-      tone: 'success',
-      title: `Preset „${name}“ gespeichert`,
-    };
+    const newOrchestratorModel = orchestratorModel(model.view.effective, name);
     interaction = { kind: 'browse' };
     await loadAndPaint();
-    void host.toast({ kind: 'success', message: `Preset „${name}“ gespeichert. ${restartHint()}` });
+    notice = { tone: 'success', title: t('presetSaved', name) };
+    paint();
+    void host.toast({ kind: 'success', message: `${t('presetSaved', name)} ${restartHint()}` });
     autoDismissNotice(5000);
     // Wenn die aktuelle Session der Orchestrator ist: anbieten, dessen Modell umzustellen.
     if (currentSessionAgent === 'orchestrator' && currentSessionId && newOrchestratorModel) {

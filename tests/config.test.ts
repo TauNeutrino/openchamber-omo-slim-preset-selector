@@ -3,12 +3,12 @@ import test from 'node:test';
 
 import {
   applyPresetToText,
+  clearPresetFromText,
   orchestratorModel,
   parseConfigText,
+  planPresetSwitch,
   resolvePresetView,
-  resolveWriteTarget,
   sortedPresetNames,
-  writeTargetAccepts,
   type ParsedLayer,
   type PresetLayerKind,
 } from '../src/config.ts';
@@ -301,7 +301,7 @@ test('does not surface the marketplace block of a flat preset as an agent', () =
   ]);
 });
 
-test('the project override wins and writes to the project file', () => {
+test('the project override wins and plans a project write', () => {
   const projectRaw = '{ "preset": "free" }';
   const global = layer('global', GLOBAL, CONFIG);
   const project = layer('project', PROJECT, projectRaw);
@@ -309,34 +309,145 @@ test('the project override wins and writes to the project file', () => {
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.deepEqual(result.view.active, { name: 'free', origin: 'project' });
+  assert.equal(result.view.globalPreset, 'opencode-go');
+  assert.equal(result.view.projectPreset, 'free');
   assert.deepEqual(result.view.agents, [
     { agent: 'orchestrator', models: [{ model: 'opencode/glm-5.3-flash-free' }] },
   ]);
-  const target = resolveWriteTarget(global, project);
-  assert.equal(target.kind, 'project');
-  assert.equal(target.path, PROJECT);
-  assert.deepEqual(target.availableNames, ['opencode-go', 'free']);
+  const plan = planPresetSwitch({ scope: 'project', name: 'free', projectPath: PROJECT, global, project });
+  assert.equal(plan.ok, true);
+  if (!plan.ok) return;
+  assert.equal(plan.path, PROJECT);
+  assert.deepEqual(plan.names, ['opencode-go', 'free']);
 });
 
-test('a project preset map decides its own names', () => {
+test('a project preset map merges with the global one', () => {
   const global = layer('global', GLOBAL, CONFIG);
-  const project = layer('project', PROJECT, '{ "preset": "local", "presets": { "local": {} } }');
+  const project = layer('project', PROJECT, '{ "preset": "local", "presets": { "local": { "oracle": { "model": "x/y" } } } }');
   const result = resolvePresetView(global, project);
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.view.active.name, 'local');
-  const target = resolveWriteTarget(global, project);
-  assert.deepEqual(target.availableNames, ['local']);
-  assert.equal(writeTargetAccepts(target, 'free'), false);
+  assert.deepEqual(result.view.origins, {
+    'opencode-go': 'global',
+    free: 'global',
+    local: 'project',
+  });
+  // A global preset stays selectable in the project layer; the maps merge.
+  const plan = planPresetSwitch({ scope: 'project', name: 'free', projectPath: PROJECT, global, project });
+  assert.equal(plan.ok, true);
 });
 
-test('an unknown project preset is refused without a write target', () => {
+test('a partial project override keeps the base agents of the preset', () => {
+  const global = layer('global', GLOBAL, `{
+    "preset": "p",
+    "presets": { "p": { "orchestrator": { "model": "a/b" }, "oracle": { "model": "c/d" } } }
+  }`);
+  const project = layer('project', PROJECT, `{
+    "preset": "p",
+    "presets": { "p": { "oracle": { "model": "e/f" } } }
+  }`);
+  const result = resolvePresetView(global, project);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.view.origins.p, 'both');
+  assert.deepEqual(result.view.agents, [
+    { agent: 'oracle', models: [{ model: 'e/f' }] },
+    { agent: 'orchestrator', models: [{ model: 'a/b' }] },
+  ]);
+});
+
+test('resolves preset inheritance and reports the parent', () => {
+  const raw = `{
+    "preset": "child",
+    "presets": {
+      "base": { "orchestrator": { "model": "a/b" }, "oracle": { "model": "c/d" } },
+      "child": { "extends": "base", "oracle": { "model": "e/f" } },
+      "deep": { "extends": "child", "fixer": { "model": "g/h" } }
+    }
+  }`;
+  const result = resolvePresetView(layer('global', GLOBAL, raw), null);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.view.parents, { base: null, child: 'base', deep: 'child' });
+  assert.deepEqual(result.view.presets.deep, [
+    { agent: 'fixer', models: [{ model: 'g/h' }] },
+    { agent: 'oracle', models: [{ model: 'e/f' }] },
+    { agent: 'orchestrator', models: [{ model: 'a/b' }] },
+  ]);
+});
+
+test('a broken inheritance is reported without locking the view', () => {
+  const raw = '{ "preset": "child", "presets": { "child": { "extends": "missing", "oracle": { "model": "a/b" } } } }';
+  const result = resolvePresetView(layer('global', GLOBAL, raw), null);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.view.agents, []);
+  assert.match(result.view.errors.child, /missing/);
+});
+
+test('root agents sit above the active preset', () => {
+  const raw = `{
+    "preset": "p",
+    "agents": { "oracle": { "model": "root/model" } },
+    "presets": { "p": { "oracle": { "model": "preset/model" }, "fixer": { "model": "f/m" } } }
+  }`;
+  const result = resolvePresetView(layer('global', GLOBAL, raw), null);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.view.agents, [
+    { agent: 'oracle', models: [{ model: 'root/model' }], source: 'root' },
+    { agent: 'fixer', models: [{ model: 'f/m' }] },
+  ]);
+  // Editing or cloning a preset must use its own agents, not the root overlay.
+  assert.deepEqual(result.view.presets.p, [
+    { agent: 'oracle', models: [{ model: 'preset/model' }] },
+    { agent: 'fixer', models: [{ model: 'f/m' }] },
+  ]);
+});
+
+test('an unknown project preset is refused', () => {
   const global = layer('global', GLOBAL, CONFIG);
-  const project = layer('project', PROJECT, '{ "preset": "free", "presets": { "local": {} } }');
+  const project = layer('project', PROJECT, '{ "preset": "nope" }');
   const result = resolvePresetView(global, project);
   assert.equal(result.ok, false);
   if (result.ok) return;
-  assert.match(result.error, /"free" ist in \.opencode\/oh-my-opencode-slim\.json nicht definiert/);
+  assert.match(result.error, /"nope" ist in \.opencode\/oh-my-opencode-slim\.json nicht definiert/);
+});
+
+test('the switch scope decides the file and refuses impossible targets', () => {
+  const global = layer('global', GLOBAL, CONFIG);
+  const project = layer('project', PROJECT, '{ "preset": "free", "presets": { "local": { "oracle": { "model": "x/y" } } } }');
+
+  const projectOnlyToGlobal = planPresetSwitch({ scope: 'global', name: 'local', projectPath: PROJECT, global, project });
+  assert.equal(projectOnlyToGlobal.ok, false);
+  if (!projectOnlyToGlobal.ok) assert.equal(projectOnlyToGlobal.code, 'not-in-global');
+
+  const closedProject = planPresetSwitch({ scope: 'project', name: 'free', projectPath: null, global, project: null });
+  assert.equal(closedProject.ok, false);
+  if (!closedProject.ok) assert.equal(closedProject.code, 'no-project');
+
+  const emptyProject = layer('project', PROJECT, '{ "presets": { "empty": {} } }');
+  const empty = planPresetSwitch({ scope: 'project', name: 'empty', projectPath: PROJECT, global, project: emptyProject });
+  assert.equal(empty.ok, false);
+  if (!empty.ok) assert.equal(empty.code, 'empty-preset');
+
+  const okGlobal = planPresetSwitch({ scope: 'global', name: 'free', projectPath: PROJECT, global, project });
+  assert.equal(okGlobal.ok, true);
+  if (okGlobal.ok) assert.equal(okGlobal.path, GLOBAL);
+
+  const okProject = planPresetSwitch({ scope: 'project', name: 'free', projectPath: PROJECT, global, project });
+  assert.equal(okProject.ok, true);
+  if (okProject.ok) assert.equal(okProject.path, PROJECT);
+});
+
+test('clearing the project override leaves the rest of the file intact', () => {
+  const raw = '{ "preset": "free", "presets": { "local": { "oracle": { "model": "x/y" } } } }';
+  const next = clearPresetFromText(raw);
+  const parsed = parseConfigText(next, PROJECT);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.config.preset, null);
+  assert.deepEqual(parsed.config.presetNames, ['local']);
 });
 
 test('an unknown global preset is refused', () => {
