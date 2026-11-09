@@ -304,8 +304,20 @@ export const parseConfigText = (raw: string, label: string): ParseOutcome => {
     if (!isPlainObject(value)) {
       return { ok: false, error: `In ${label} ist "agents" kein Objekt.` };
     }
-    for (const [agent, entry] of Object.entries(value)) {
-      if (isPlainObject(entry)) rootAgents[agent] = entry as AgentOverride;
+    // Object.getOwnPropertyNames is used instead of Object.entries: the parser
+    // materialises a `__proto__` key as an own property while Object.entries
+    // skips it (it would otherwise be a prototype set, not a config entry).
+    for (const agent of Object.getOwnPropertyNames(value)) {
+      const entry = (value as Record<string, unknown>)[agent];
+      if (!isPlainObject(entry)) continue;
+      // Object.defineProperty keeps a `__proto__` agent key an own data
+      // property instead of assigning through the prototype.
+      Object.defineProperty(rootAgents, agent, {
+        value: entry as AgentOverride,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
   }
 
@@ -764,19 +776,47 @@ const expectedAgentBlock = (
   return expected;
 };
 
+/**
+ * Prototype-safe deep copy: plain objects are copied with own data properties
+ * only, so a key like `__proto__` from a config file can never rewrite a
+ * prototype inside verification.
+ */
+const safeClone = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(safeClone);
+  if (!isPlainObject(value)) return value;
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(copy, key, {
+      value: safeClone(value[key]),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return copy;
+};
+
 const expectedRootWithAgent = (
   root: Record<string, unknown>,
   path: string[],
   block: Record<string, unknown>,
 ): Record<string, unknown> => {
-  const copy = JSON.parse(JSON.stringify(root)) as Record<string, unknown>;
+  const copy = safeClone(root) as Record<string, unknown>;
   let node: Record<string, unknown> = copy;
   for (let index = 0; index < path.length - 1; index += 1) {
     const key = path[index];
-    if (!isPlainObject(node[key])) node[key] = {};
+    if (!isPlainObject(node[key])) {
+      const branch: Record<string, unknown> = {};
+      Object.defineProperty(node, key, { value: branch, writable: true, enumerable: true, configurable: true });
+    }
     node = node[key] as Record<string, unknown>;
   }
-  node[path[path.length - 1]] = JSON.parse(JSON.stringify(block));
+  Object.defineProperty(node, path[path.length - 1], {
+    value: safeClone(block),
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
   return copy;
 };
 
@@ -970,7 +1010,7 @@ export const removeAgentFromText = (
   const afterRoot = readRoot(next);
   if (!afterRoot) throw new Error(t('changeNotVerified'));
 
-  const expectedRoot = deleteAtPath(JSON.parse(JSON.stringify(root)) as Record<string, unknown>, location.path);
+  const expectedRoot = deleteAtPath(safeClone(root) as Record<string, unknown>, location.path);
   if (stableJson(afterRoot) !== stableJson(expectedRoot)) {
     throw new Error(t('changeNotVerified'));
   }

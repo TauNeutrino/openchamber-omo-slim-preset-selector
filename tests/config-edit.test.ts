@@ -463,3 +463,26 @@ test('removeAgentFromText refuses an unknown agent', () => {
     /Agent "nope"/,
   );
 });
+
+test('a config carrying __proto__ neighbours does not pollute the verification path', () => {
+  const raw = '{"presets":{"p":{"oracle":{"model":"a/b"}}},"agents":{"__proto__":{"model":"x/y"},"constructor":{"model":"z/w"}},"preset":"p"}';
+  const next = applyAgentPatchToText(raw, { kind: 'preset', presetName: 'p' }, 'oracle', { variant: 'high' });
+  const parsed = parseConfigText(next, 'out');
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  // The prototype-sensitive keys stay own properties of the parsed map and
+  // never leak into the prototype.
+  const rootNames = Object.getOwnPropertyNames(parsed.config.rootAgents);
+  assert.equal(rootNames.includes('constructor'), true);
+  assert.equal(
+    Object.getOwnPropertyNames(parsed.config.rootAgents)
+      .some((name) => name !== 'constructor' && name !== '__proto__'),
+    false,
+  );
+  assert.equal(({} as Record<string, unknown>).model, undefined);
+  assert.equal(Object.getPrototypeOf(parsed.config.rootAgents), Object.prototype);
+  // And the document itself is untouched.
+  assert.equal(next.includes('"__proto__":'), true);
+  assert.equal(next.includes('"model": "z/w"'), true);
+  assert.equal(({} as Record<string, unknown>).model, undefined);
+});

@@ -1579,10 +1579,42 @@ const closeAgentEditor = (): void => {
   if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
 };
 
+/**
+ * Re-reads the layers and refreshes the view, so an editor session that was
+ * open while the file changed does not silently overwrite it with a patch
+ * built from a stale view.
+ */
+const resyncEditorView = async (): Promise<boolean> => {
+  const layers = await readLayers(directory);
+  if (layers.status === 'failed') return false;
+  const resolved = resolvePresetView(layers.global, layers.project);
+  if (!resolved.ok) return false;
+  const model = screen.kind === 'ready' ? screen.model : null;
+  if (!model) return false;
+  screen = {
+    kind: 'ready',
+    model: {
+      ...model,
+      global: layers.global,
+      project: layers.project,
+      view: resolved.view,
+      directory,
+    },
+  };
+  return true;
+};
+
 const saveAgentEditor = async (): Promise<void> => {
   const editor = agentEditor;
   const model = screen.kind === 'ready' ? screen.model : null;
   if (!editor || !model) return;
+  if (!(await resyncEditorView())) {
+    notice = { tone: 'error', title: t('editorNotSaved'), body: t('configUnreadable') };
+    paint();
+    return;
+  }
+  const refreshed = screen.kind === 'ready' ? screen.model : null;
+  if (!refreshed) return;
   const built = patchFromDraft(editor.draft);
   if (!built.ok) {
     notice = {
@@ -1594,14 +1626,13 @@ const saveAgentEditor = async (): Promise<void> => {
     autoDismissNotice(6000);
     return;
   }
-  const path = editorTargetPath(model, editor);
+  const path = editorTargetPath(refreshed, editor);
   const target = editor.target.scope === 'root'
     ? { kind: 'root' as const }
     : { kind: 'preset' as const, presetName: editor.presetName };
   try {
-    const file = await readConfigFile(path);
-    if (file.kind === 'failed') throw new Error(file.message);
-    const base = file.kind === 'file' ? file.raw : '';
+    const patchLayer = editor.target.layer === 'project' ? refreshed.project : refreshed.global;
+    const base = patchLayer?.raw ?? '';
     // A missing file (or an empty one) needs a root object; a new project preset
     // starts as an empty block so the patch lands inside it.
     const seeded = base.trim()
@@ -1627,6 +1658,11 @@ const removeAgentFromTarget = async (): Promise<void> => {
   const editor = agentEditor;
   const model = screen.kind === 'ready' ? screen.model : null;
   if (!editor || !model) return;
+  if (!(await resyncEditorView())) {
+    notice = { tone: 'error', title: t('editorNotSaved'), body: t('configUnreadable') };
+    paint();
+    return;
+  }
   const path = editorTargetPath(model, editor);
   const target = editor.target.scope === 'root'
     ? { kind: 'root' as const }

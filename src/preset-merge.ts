@@ -100,6 +100,22 @@ const agentMap = (value: unknown): Record<string, AgentOverride> => {
   return result;
 };
 
+/**
+ * Every key of a JSON object as own data properties. `Object.entries` skips
+ * nothing relevant, but it loses the distinction an object literal made for
+ * `__proto__`: the parser's own-name list is the only way to see that key.
+ */
+const ownNamesOf = (value: Record<string, unknown>): string[] => [
+  ...Object.keys(value),
+  ...Object.getOwnPropertyNames(value).filter((name) => !(name in value)),
+];
+
+// Prototype-sensitive agent names are not valid identifiers for an override map:
+// they would resolve through Object.prototype instead of own entries.
+const isUsableAgentName = (name: string): boolean => (
+  name !== '__proto__' && name !== 'constructor' && name !== 'prototype'
+);
+
 const isPresetAgentMap = (value: unknown): boolean => {
   if (!isRecord(value)) return false;
   return Object.keys(value).every((name) => isRecord(ownValue(value, name)));
@@ -113,6 +129,21 @@ const usesStructuredPresetSyntax = (input: unknown): boolean => {
   if (!isRecord(input)) return false;
   const agents = ownValue(input, 'agents');
   return isRecord(agents) && isPresetAgentMap(agents);
+};
+
+/** An agent override map must only carry usable agent names. */
+const mergeAgentOverrideMaps = (
+  base: Record<string, AgentOverride> | undefined,
+  override: Record<string, AgentOverride> | undefined,
+): Record<string, AgentOverride> => {
+  const result: Record<string, AgentOverride> = {};
+  for (const [name, entry] of Object.entries(base ?? {})) {
+    if (isUsableAgentName(name) && isRecord(entry)) defineOwn(result, name, entry);
+  }
+  for (const [name, entry] of Object.entries(override ?? {})) {
+    if (isUsableAgentName(name) && isRecord(entry)) defineOwn(result, name, entry);
+  }
+  return result;
 };
 
 const isMarketplaceActivation = (value: unknown): boolean => (
@@ -225,7 +256,7 @@ const canonicalizeAgentAliases = (
 ): Record<string, AgentOverride> => {
   const result: Record<string, AgentOverride> = {};
   for (const [name, override] of Object.entries(agents)) {
-    if (!isRecord(override)) continue;
+    if (!isUsableAgentName(name) || !isRecord(override)) continue;
     const canonicalName = aliasOf(name) ?? name;
     defineOwn(
       result,
@@ -317,8 +348,9 @@ export const normalizePreset = (input: unknown): NormalizedPreset => {
   if (isRecord(input) && usesStructuredPresetSyntax(input)) {
     const agents = agentMap(ownValue(input, 'agents'));
     const inlineEntries: Record<string, unknown> = {};
-    for (const [name, value] of Object.entries(input)) {
+    for (const name of ownNamesOf(input)) {
       if (name === 'agents' || name === 'extends' || name === 'marketplace') continue;
+      const value = ownValue(input, name);
       if (isRecord(value)) defineOwn(inlineEntries, name, value);
     }
 
@@ -339,9 +371,10 @@ export const normalizePreset = (input: unknown): NormalizedPreset => {
   const hasMarketplace = isMarketplaceActivation(marketplaceValue);
 
   const agents: Record<string, AgentOverride> = {};
-  for (const [name, value] of Object.entries(record)) {
+  for (const name of ownNamesOf(record)) {
     if (name === 'extends' && hasParent) continue;
     if (name === 'marketplace' && hasMarketplace) continue;
+    const value = ownValue(record, name);
     if (!isRecord(value)) continue;
     defineOwn(agents, name, value as AgentOverride);
   }
@@ -406,7 +439,8 @@ const normalizePresetMap = (
 ): Record<string, NormalizedPreset> => {
   const result: Record<string, NormalizedPreset> = {};
   if (!isRecord(map)) return result;
-  for (const name of Object.keys(map)) {
+  for (const name of ownNamesOf(map)) {
+    if (!isUsableAgentName(name)) continue;
     defineOwn(result, name, normalizePreset(ownValue(map, name)));
   }
   return result;
@@ -429,7 +463,9 @@ export const mergePresetMaps = (
   }
 
   const result = normalizePresetMap(base);
-  for (const [name, overrideInput] of Object.entries(override)) {
+  for (const name of ownNamesOf(override)) {
+    if (!isUsableAgentName(name)) continue;
+    const overrideInput = ownValue(override, name);
     const baseInput = ownValue(base, name);
     if (!baseInput) {
       defineOwn(result, name, normalizePreset(overrideInput));
