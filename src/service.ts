@@ -7,12 +7,9 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import fs from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseCatalogOutput } from './model-audit.ts';
-import { abortArgs, buildStopRecord, stopFilePath } from './stop.ts';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? '0');
 const TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -94,43 +91,6 @@ const send = (res: http.ServerResponse, status: number, body: unknown): void => 
   res.end(payload);
 };
 
-/**
- * Aborts the given sessions and drops the plugin's stop record for the project,
- * so the orchestrator's next turn carries the emergency-stop notice. Each abort
- * is best effort: a session that already finished is not an error worth
- * reporting to the panel.
- */
-const killSessions = async (sessionIds: string[], parents: string[], directory: string): Promise<{
-  aborted: number;
-  failed: number;
-  stopPath: string;
-}> => {
-  const cmd = CLI_CANDIDATES()[0];
-  const abortOne = (sessionId: string): Promise<boolean> => new Promise((resolve) => {
-    execFile(cmd, abortArgs(sessionId), { timeout: 10_000, windowsHide: true, maxBuffer: 1024 * 1024 },
-      (error) => resolve(!error));
-  });
-  const results = await Promise.all(sessionIds.map(abortOne));
-
-  const dataHome = process.env.XDG_DATA_HOME ?? path.join(homedir(), '.local', 'share');
-  const stopPath = stopFilePath(dataHome, directory);
-  const record = buildStopRecord(parents, Date.now());
-  fs.mkdirSync(path.dirname(stopPath), { recursive: true });
-  const tmp = `${stopPath}.${process.pid}.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(record));
-    fs.renameSync(tmp, stopPath);
-  } finally {
-    try { fs.unlinkSync(tmp); } catch { /* already renamed */ }
-  }
-
-  return {
-    aborted: results.filter(Boolean).length,
-    failed: results.filter((ok) => !ok).length,
-    stopPath,
-  };
-};
-
 const server = http.createServer(async (req, res) => {
   if (req.method !== 'GET' && req.method !== 'POST') {
     send(res, 405, { ok: false, error: 'method-not-allowed' });
@@ -172,31 +132,6 @@ const server = http.createServer(async (req, res) => {
               (error, _stdout, stderr) => (error ? reject(new Error(stderr || error.message)) : resolve()));
           });
           send(res, 200, { ok: true });
-        } catch (error) {
-          send(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
-        }
-      });
-      return;
-    }
-    if (url.pathname === '/kill-sessions' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (chunk: Buffer) => { body += chunk.toString('utf8'); });
-      req.on('end', async () => {
-        try {
-          const parsed = JSON.parse(body || '{}') as { sessionIds?: unknown; parents?: unknown; directory?: unknown };
-          const ids = Array.isArray(parsed.sessionIds)
-            ? parsed.sessionIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
-            : [];
-          const parents = Array.isArray(parsed.parents)
-            ? parsed.parents.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
-            : [];
-          const directory = typeof parsed.directory === 'string' ? parsed.directory.trim() : '';
-          if (ids.length === 0 || !directory || !path.isAbsolute(directory)) {
-            send(res, 400, { ok: false, error: 'missing-args' });
-            return;
-          }
-          const result = await killSessions(ids, parents, directory);
-          send(res, 200, { ok: true, ...result });
         } catch (error) {
           send(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
         }
