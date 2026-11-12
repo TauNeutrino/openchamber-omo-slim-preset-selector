@@ -74,3 +74,11 @@ test('collectModelRefs ignores empty and invalid model entries', () => {
   );
   assert.deepEqual(refs, ['a/b']);
 });
+
+test('collectModelRefs reads every entry of a fallback chain', () => {
+  const refs = collectModelRefs(
+    [{ models: [{ model: 'a/b' }, { model: 'c/d' }] }, { model: 'e/f' }],
+    [[{ models: [{ model: 'c/d' }, { model: 'g/h' }] }], null],
+  );
+  assert.deepEqual(refs, ['a/b', 'c/d', 'e/f', 'g/h']);
+});

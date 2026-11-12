@@ -27,7 +27,13 @@ export const parseCatalogOutput = (stdout: string): string[] => {
   return [...seen];
 };
 
-export type ModelRefLike = { model: string; variant?: string };
+export type ModelRefLike = {
+  /** A single model, as older entries and tests carry it. */
+  model?: string | null;
+  variant?: string;
+  /** The full fallback chain when the entry is a preset agent. */
+  models?: readonly { model: string }[] | null;
+};
 
 export type ModelAuditFinding = {
   /** `provider/model` reference as configured. */
@@ -44,6 +50,17 @@ export type ModelAudit = {
   catalogSize: number;
 };
 
+/** Every model reference one entry carries: the whole chain, primary first. */
+const refsOf = (entry: ModelRefLike): string[] => {
+  if (Array.isArray(entry.models) && entry.models.length > 0) {
+    return entry.models
+      .map((ref) => (ref && typeof ref.model === 'string' ? ref.model.trim() : ''))
+      .filter((ref) => ref.length > 0);
+  }
+  const single = typeof entry.model === 'string' ? entry.model.trim() : '';
+  return single ? [single] : [];
+};
+
 /** Every model reference the panel's layers reference, deduped, in stable order. */
 export const collectModelRefs = (
   activeAgents: readonly ModelRefLike[],
@@ -54,9 +71,11 @@ export const collectModelRefs = (
   const push = (list: readonly ModelRefLike[] | null): void => {
     for (const entry of list ?? []) {
       if (typeof entry !== 'object' || entry === null) continue;
-      if (typeof entry.model !== 'string' || !entry.model.trim() || seen.has(entry.model)) continue;
-      seen.add(entry.model);
-      refs.push(entry.model);
+      for (const ref of refsOf(entry)) {
+        if (seen.has(ref)) continue;
+        seen.add(ref);
+        refs.push(ref);
+      }
     }
   };
   push(activeAgents);

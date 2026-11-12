@@ -1,14 +1,14 @@
 # oMo Slim Preset Selector
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![version](https://img.shields.io/badge/version-1.5.16)](package.json)
+[![version](https://img.shields.io/badge/version-1.5.17)](package.json)
 
 An OpenChamber extension that shows the active **oh-my-opencode-slim** preset and switches it — without the TUI and without editing the config by hand.
 
 ![Screenshot](assets/screenshot.png)
 
 - Panel on the right rail and a section in the Work Status panel.
-- Shows the active preset, its origin (`Global` / `Project`), and the agent→model mapping of the active preset.
+- Shows the active preset, its origin (`Global` / `Project`), and the agent→model mapping of the active preset — including fallback chains (`model` arrays) and agents that inherit their model.
 - Dropdown of every preset, with the orchestrator model as a decision hint.
 - Confirmation dialog before every switch; cancelling writes nothing.
 - Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
@@ -41,6 +41,10 @@ The project map is merged over the global one; the active preset's origin badge 
 ## Model check
 
 After every load (and then every 15 minutes) the panel checks whether the configured models still exist in the effective catalog. The catalog comes from a small host-managed service that asks `opencode models` (60 s cache, no background load). Missing models are marked red on the agent row and summarized as a warning banner. Unavailable models never crash the switch — the user decides.
+
+## Fallback chains
+
+`model` may be a string or an array of strings and `{ "id", "variant" }` entries, which oh-my-opencode-slim tries in order. The panel shows the primary model plus a `+N` badge for the remaining candidates (`+0` when there is no fallback, so the badge column stays aligned); the tooltip lists the whole chain. Every entry is checked against the catalog. Changing a model from the picker replaces the primary and keeps the other candidates as fallbacks; a model already in the chain is not duplicated. Agents that only set `inheritModelFrom` (`session` / `orchestrator`) are listed with that source instead of a model.
 
 ## Sessions per agent
 

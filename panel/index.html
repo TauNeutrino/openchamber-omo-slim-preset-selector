@@ -127,16 +127,19 @@
       .option-check { flex: none; font-size: 11px; color: var(--oc-info, #3fa9f5); }
       .preset-option[data-active="true"] .option-check { color: inherit; }
 
-      /* Zwei geteilte Spalten über alle Zeilen: Agenten links (Breite =
-         breitester Name), Modelle bündig rechts und nie in der Agenten-
-         Spalte. display:contents macht Tiefenstruktur zu Grid-Kindern. */
+      /* Agent list: a two-column shared grid. The name column sizes to the
+         widest disclosure; the model column gets the rest and is read as a
+         single left-aligned line. Model IDs therefore start on the same
+         x-position across every row. */
       .agents {
         display: grid;
         grid-template-columns: max-content minmax(0, 1fr);
         column-gap: 12px;
         row-gap: 2px;
-        align-items: center;
+        align-items: baseline;
         padding-top: 1px;
+        container-type: inline-size;
+        container-name: agents;
       }
       .agents-empty { grid-column: 1 / -1; font-size: 11px; color: var(--oc-muted, #999); }
       .model-picker { margin-top: 8px; padding: 6px 8px; border: 1px solid var(--oc-border, rgba(127,127,127,0.28)); border-radius: 6px; background: var(--oc-card, rgba(127,127,127,0.06)); font-size: 11px; max-height: 220px; display: flex; flex-direction: column; }
@@ -150,6 +153,7 @@
       .picker-option.is-current { color: var(--oc-info, #4a9eff); font-weight: 600; }
       .picker-empty { color: var(--oc-muted, #999); font-size: 11px; padding: 4px 6px; }
       .agent-model.is-editable:hover { background: var(--oc-hover, rgba(127,127,127,0.15)); border-radius: 4px; }
+      .agent-model.is-editable { cursor: pointer; }
       .origin-badge {
         display: inline-flex;
         align-items: center;
@@ -192,59 +196,12 @@
       .agent-model { grid-column: 2; }
       .agent-name {
         min-width: 0;
-        max-width: 24ch;
+        max-width: 14ch;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
         font-size: 11.5px;
         color: var(--oc-muted, #999);
-      }
-      .agent-model {
-        display: flex;
-        align-items: baseline;
-        justify-content: flex-end;
-        gap: 5px;
-        min-width: 0;
-        font: 11px/1.4 var(--oc-mono, ui-monospace, monospace);
-        text-align: right;
-      }
-      /* Modell-ID und Variant-Pill bleiben immer voll sichtbar; nur der
-         dezente Provider-Anteil wird bei Platzmangel mit „…“ gekürzt. */
-      .model-text {
-        display: inline-flex;
-        flex: 0 1 auto;
-        min-width: 0;
-        max-width: 100%;
-      }
-      .model-provider {
-        flex: 0 1 auto;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: var(--oc-muted, #999);
-      }
-      .model-content { flex: 0 0 auto; white-space: nowrap; }
-      /* Modell-ID wird bei Platzmangel links abgeschnitten, damit ihr Ende
-         und die Variante rechts immer sichtbar bleiben. */
-      .model-text .model-content {
-        flex: 1 1 auto;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        direction: rtl;
-        unicode-bidi: plaintext;
-        text-align: right;
-      }
-      .variant {
-        flex: 0 0 auto;
-        padding: 0 5px;
-        border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.28));
-        border-radius: 999px;
-        color: var(--oc-muted, #999);
-        font: 10px/1.6 var(--oc-mono, ui-monospace, monospace);
-        white-space: nowrap;
       }
       .agent-disclosure {
         display: inline-flex;
@@ -261,7 +218,7 @@
         cursor: pointer;
       }
       .agent-disclosure:hover, .agent-disclosure[aria-expanded="true"] { background: var(--oc-hover, rgba(127, 127, 127, 0.15)); }
-      .agent-disclosure .agent-name { max-width: none; }
+      .agent-disclosure .agent-name { max-width: 14ch; }
       .session-count { flex: none; color: var(--oc-info, #3fa9f5); font-size: 12.5px; line-height: 1; }
       /* Fertige Sessions: Ziffer im Quadrat — Unicode kennt keine, also zeichnet
          CSS den Rahmen (flexibles Rundeck statt Emoji-Keycaps). */
@@ -279,6 +236,68 @@
       }
       .session-count sup { font-size: 9px; }
       .agent-chevron { flex: none; color: var(--oc-muted, #999); font-size: 9px; }
+      /* Model line: only the model id is visible; the full provider/id chain
+         lives in .agent-model's title. The content flexes and truncates; pills
+         sit at the end and never push the id to a different start position. */
+      .agent-model {
+        display: flex;
+        align-items: baseline;
+        justify-content: flex-start;
+        gap: 5px;
+        min-width: 0;
+        font: 11px/1.4 var(--oc-mono, ui-monospace, monospace);
+      }
+      .model-text {
+        display: flex;
+        align-items: baseline;
+        flex: 1 1 auto;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+      }
+      .model-content { flex: 0 0 auto; white-space: nowrap; }
+      .model-text .model-content {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .model-content.is-inherited {
+        color: var(--oc-muted, #999);
+        font-style: italic;
+      }
+      .agent-pills {
+        display: flex;
+        align-items: center;
+        flex-wrap: nowrap;
+        gap: 3px;
+        flex: 0 0 auto;
+        min-width: 0;
+      }
+      .variant {
+        flex: 0 0 auto;
+        padding: 0 4px;
+        border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.28));
+        border-radius: 999px;
+        color: var(--oc-muted, #999);
+        font: 9px/1.5 var(--oc-mono, ui-monospace, monospace);
+        white-space: nowrap;
+        max-width: 12ch;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* Number of models the agent falls back to; dashed to read as a count,
+         not as another model id. */
+      .variant.fallback-count {
+        padding: 0 3px;
+        border-style: dashed;
+        font-size: 8px;
+      }
+      /* Zero fallbacks still occupy the column, but stay out of the way. */
+      .variant.fallback-count.is-zero {
+        opacity: 0.5;
+      }
       /* Session-Baum: eingerückt unter dem Agenten, keine eigene Box,
          Schriftgröße maximal auf Höhe des Agenten-Texts. */
       .session-list {
@@ -332,6 +351,13 @@
         line-height: 1;
       }
       .session-hide:hover { color: var(--oc-fg, #ddd); background: var(--oc-hover, rgba(127, 127, 127, 0.15)); }
+
+      @container agents (max-width: 289px) {
+        .agent-name { max-width: 12ch; }
+        .agent-disclosure .agent-name { max-width: 12ch; }
+        .variant { padding: 0 3px; font-size: 8px; }
+        .variant.fallback-count { font-size: 7px; }
+      }
 
       .tree-section {
         min-width: 0;
@@ -400,7 +426,7 @@
       .tree-metadata { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--oc-mono, ui-monospace, monospace); }
 
       /* Model availability: missing refs stand out on the agent row and in the check line. */
-      .agent-group.is-missing .model-content { color: var(--oc-destructive, #f38ba8); }
+      .agent-group.is-missing .model-text > .model-content { color: var(--oc-destructive, #f38ba8); }
       .agent-group.is-missing .agent-disclosure .agent-name { color: var(--oc-destructive, #f38ba8); }
       .agent-group.is-missing .agent-name { color: var(--oc-destructive, #f38ba8); }
       .confirm {
@@ -477,6 +503,6 @@
   </head>
   <body>
     <div id="root"></div>
-    <script src="main.js?v=1.5.16"></script>
+    <script src="main.js?v=1.5.17"></script>
   </body>
 </html>
