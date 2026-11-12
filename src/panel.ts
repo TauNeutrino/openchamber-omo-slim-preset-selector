@@ -1553,7 +1553,7 @@ const openAgentEditor = (agent: PresetAgent, model: ReadyModel): void => {
     presetName: model.view.active.name,
     target: {
       scope: 'preset',
-      layer: origin === 'project' ? 'project' : 'global',
+      layer: origin === 'global' ? 'global' : 'project',
     },
     draft: draftFromAgent(agent),
     chainOpen: true,
@@ -1633,9 +1633,11 @@ const saveAgentEditor = async (): Promise<void> => {
   try {
     const patchLayer = editor.target.layer === 'project' ? refreshed.project : refreshed.global;
     const base = patchLayer?.raw ?? '';
-    // A missing file (or an empty one) needs a root object; a new project preset
-    // starts as an empty block so the patch lands inside it.
-    const seeded = base.trim()
+    const parsedBase = parseConfigText(base, path);
+    const commentOnly = parsedBase.ok && parsedBase.config.commentOnly;
+    // A missing, empty or comment-only file needs a root object; a new project
+    // preset starts as an empty block so the patch lands inside it.
+    const seeded = base.trim() && !commentOnly
       ? base
       : editor.target.scope === 'root'
         ? '{}\n'
@@ -1663,7 +1665,9 @@ const removeAgentFromTarget = async (): Promise<void> => {
     paint();
     return;
   }
-  const path = editorTargetPath(model, editor);
+  const refreshed = screen.kind === 'ready' ? screen.model : null;
+  if (!refreshed) return;
+  const path = editorTargetPath(refreshed, editor);
   const target = editor.target.scope === 'root'
     ? { kind: 'root' as const }
     : { kind: 'preset' as const, presetName: editor.presetName };

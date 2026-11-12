@@ -715,7 +715,17 @@ const expectedAgentBlock = (
   before: Record<string, unknown> | null,
   patch: AgentPatch,
 ): Record<string, unknown> => {
-  const expected: Record<string, unknown> = { ...(before ?? {}) };
+  const expected: Record<string, unknown> = {};
+  if (before) {
+    for (const key of Object.getOwnPropertyNames(before)) {
+      Object.defineProperty(expected, key, {
+        value: before[key],
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
   const remove = (key: string): void => { delete expected[key]; };
   const assign = (key: string, value: unknown): void => { expected[key] = value; };
 
@@ -821,8 +831,16 @@ const expectedRootWithAgent = (
 };
 
 const rootWithoutKey = (root: Record<string, unknown>, key: string): string => {
-  const copy = { ...root };
-  delete copy[key];
+  const copy: Record<string, unknown> = {};
+  for (const k of Object.getOwnPropertyNames(root)) {
+    if (k === key) continue;
+    Object.defineProperty(copy, k, {
+      value: root[k],
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
   return JSON.stringify(copy);
 };
 
@@ -915,17 +933,25 @@ export const applyAgentPatchToText = (
 
   const before = parseConfigText(raw, t('configLabel'));
   if (!before.ok) throw new Error(before.error);
-  if (before.config.commentOnly) throw new Error(t('changeNotVerified'));
-
   const hasBom = raw.startsWith(BOM);
-  const content = hasBom ? raw.slice(1) : raw;
+  const content0 = hasBom ? raw.slice(1) : raw;
+  const fmt = formattingFor(content0);
+
+  let content = content0;
+  if (before.config.commentOnly) {
+    const prefix = content.trimEnd();
+    if (target.kind === 'root') {
+      content = `${prefix ? `${prefix}${fmt.eol}` : ''}{}${fmt.eol}`;
+    } else {
+      content = `${prefix ? `${prefix}${fmt.eol}` : ''}${JSON.stringify({ presets: { [target.presetName]: {} } }, null, fmt.tabSize || 2)}${fmt.eol}`;
+    }
+  }
   const root = readRoot(content);
   if (!root) throw new Error(t('mustBeJsonObject'));
 
   const location = locateAgent(root, target, nextAgent);
   const expected = expectedAgentBlock(location.block, patch);
 
-  const fmt = formattingFor(content);
   let next = content;
   const setField = (key: string, value: unknown): void => {
     const edits = modify(
@@ -990,7 +1016,7 @@ export const removeAgentFromText = (
 
   const before = parseConfigText(raw, t('configLabel'));
   if (!before.ok) throw new Error(before.error);
-  if (before.config.commentOnly) throw new Error(t('changeNotVerified'));
+  if (before.config.commentOnly) throw new Error(agentNotDefined(nextAgent, target));
 
   const hasBom = raw.startsWith(BOM);
   const content = hasBom ? raw.slice(1) : raw;
@@ -1029,29 +1055,37 @@ export const removeAgentFromText = (
 export const applyAgentModelToText = (
   raw: string, presetName: string, agentName: string, model: string, variant?: string | null,
 ): string => {
+  const nextPreset = presetName.trim();
+  const nextAgent = agentName.trim();
+  if (!nextPreset || !nextAgent) throw new Error(t('presetNameEmpty'));
   const nextModel = model.trim();
   if (!nextModel) throw new Error(t('presetNameEmpty'));
   const before = parseConfigText(raw, t('configLabel'));
   if (!before.ok) throw new Error(before.error);
-  if (before.config.commentOnly) throw new Error(t('changeNotVerified'));
 
   const hasBom = raw.startsWith(BOM);
-  const content = hasBom ? raw.slice(1) : raw;
+  const content0 = hasBom ? raw.slice(1) : raw;
+  const fmt = formattingFor(content0);
+
+  let content = content0;
+  if (before.config.commentOnly) {
+    const prefix = content.trimEnd();
+    content = `${prefix ? `${prefix}${fmt.eol}` : ''}${JSON.stringify({ presets: { [nextPreset]: {} } }, null, fmt.tabSize || 2)}${fmt.eol}`;
+  }
   const parsed = parseJsonc(content, [], { allowTrailingComma: true });
   if (!isPlainObject(parsed)) throw new Error(t('mustBeJsonObject'));
   const presets = isPlainObject(parsed.presets) ? parsed.presets : null;
-  if (!presets || !isPlainObject(presets[presetName])) throw new Error(t('presetNotDefined', presetName, t('configLabel')));
-  const block = presets[presetName] as Record<string, unknown>;
+  if (!presets || !isPlainObject(presets[nextPreset])) throw new Error(t('presetNotDefined', nextPreset, t('configLabel')));
+  const block = presets[nextPreset] as Record<string, unknown>;
   const wrapped = isPlainObject(block.agents);
   const basePath = wrapped
-    ? ['presets', presetName, 'agents', agentName]
-    : ['presets', presetName, agentName];
+    ? ['presets', nextPreset, 'agents', nextAgent]
+    : ['presets', nextPreset, nextAgent];
   const agentBlock = wrapped
-    ? (isPlainObject(block.agents) ? (block.agents as Record<string, unknown>)[agentName] : null)
-    : (block as Record<string, unknown>)[agentName];
+    ? (isPlainObject(block.agents) ? (block.agents as Record<string, unknown>)[nextAgent] : null)
+    : (block as Record<string, unknown>)[nextAgent];
   const currentModel = isPlainObject(agentBlock) ? agentBlock.model : undefined;
 
-  const fmt = formattingFor(content);
   const v = variant?.trim() ?? '';
   let next = content;
   if (Array.isArray(currentModel)) {
@@ -1063,7 +1097,9 @@ export const applyAgentModelToText = (
       const id = typeof item === 'string' ? item.trim() : (isPlainObject(item) ? nonEmptyString(item.id) : null);
       return id !== nextModel;
     });
-    const modelEdits = modify(next, [...basePath, 'model'], [entry, ...rest], { formattingOptions: fmt });
+    const chain = [entry, ...rest];
+    const written = chain.length === 1 && typeof chain[0] === 'string' ? chain[0] : chain;
+    const modelEdits = modify(next, [...basePath, 'model'], written, { formattingOptions: fmt });
     next = applyEdits(next, modelEdits);
   } else {
     const modelEdits = modify(next, [...basePath, 'model'], nextModel, { formattingOptions: fmt });

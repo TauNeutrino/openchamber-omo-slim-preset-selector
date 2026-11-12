@@ -413,11 +413,13 @@ const mergeMarketplaceActivation = (
         ]
   );
 
-  return {
-    agents: override.agents ?? base.agents,
+  const merged: MarketplaceActivation = {
     agents_add: mergeDirectives(base.agents_add, override.agents_add, override.agents_remove),
     agents_remove: mergeDirectives(base.agents_remove, override.agents_remove, override.agents_add),
   };
+  const agents = override.agents ?? base.agents;
+  if (agents !== undefined) merged.agents = agents;
+  return merged;
 };
 
 const resolveMarketplaceActivation = (
