@@ -1,6 +1,6 @@
 {
   "name": "omo-preset",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "private": true,
   "description": "Switch oh-my-opencode-slim presets from an OpenChamber panel without touching the rest of the config.",
   "type": "module",
@@ -13,7 +13,7 @@
       "panel": {
         "id": "omo-preset",
         "name": "oMo Slim Preset Selector",
-        "icon": "arrow-left-right",
+        "icon": "inbox-unarchive",
         "entry": "panel/index.html"
       },
       "statusSection": {
