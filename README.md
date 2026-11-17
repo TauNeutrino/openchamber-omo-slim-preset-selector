@@ -1,7 +1,7 @@
 # oMo Slim Preset Selector
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![version](https://img.shields.io/badge/version-1.6.6)](package.json)
+[![version](https://img.shields.io/badge/version-1.7.0)](package.json)
 
 An OpenChamber extension that shows the active **oh-my-opencode-slim** preset and switches it — without the TUI and without editing the config by hand.
 
@@ -14,6 +14,7 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 - Confirmation dialog before every switch; cancelling writes nothing.
 - Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
 - Per-agent editor behind the preset-editing setting: ordered fallback chain with a variant per entry, `inheritModelFrom`, temperature, skills/skills_add/skills_remove, MCPs, permission, display name and color — written to the preset or to the root `agents` map, in either layer.
+- **Source editor in the side panel**: the pencil next to the active preset (in the Work Status section and in the panel) opens the rail panel with the raw JSONC of the file that defines the active preset — the project override when it defines it, otherwise the global config. Saves are validated first: invalid JSONC, a non-object root or a missing/broken `presets` map is refused and nothing is written. `Ctrl/Cmd+S` and the Save button go through the same gate; the validation pill shows the position of the first error.
 - Checks configured models against the effective model catalog and marks missing ones in red.
 - Tracks active and recently finished sessions per agent, with live runtime display.
 - Effective after a Managed Service restart (Settings → Apply & Restart).

@@ -37,6 +37,7 @@ import {
   type AgentEditorDraft,
 } from './agent-editor.ts';
 import { countGlyph, groupAgentSessions, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
+import { validatePresetSource, type PresetSourceValidation } from './preset-source.ts';
 
 import { setLocale, t } from './i18n.ts';
 import { auditModelRefs, collectModelRefs, type ModelAudit } from './model-audit.ts';
@@ -53,6 +54,8 @@ const PROJECT_PATHS = [
   '.opencode/oh-my-opencode-slim.json',
   '.opencode/oh-my-opencode-slim.jsonc',
 ];
+const PRESET_EDITOR_REQUEST_KEY = 'presetEditorRequest';
+const PRESET_EDITOR_POLL_MS = 1500;
 const restartHint = (): string => t('restartHint');
 
 type Notice = { tone: Extract<Tone, 'success' | 'warning' | 'error' | 'info'>; title: string; body?: string };
@@ -64,10 +67,27 @@ type ReadyModel = {
   directory: string | null;
 };
 
+type PresetEditorLayer = 'global' | 'project';
+
+type PresetEditorState = {
+  /** The panel state to restore when the editor is closed. */
+  model: ReadyModel;
+  layer: PresetEditorLayer;
+  presetName: string;
+  path: string;
+  content: string;
+  original: string;
+  validation: PresetSourceValidation;
+  errorTitle: string | null;
+  error: string | null;
+  saving: boolean;
+};
+
 type Screen =
   | { kind: 'loading' }
   | { kind: 'failed'; title: string; detail: string }
-  | { kind: 'ready'; model: ReadyModel };
+  | { kind: 'ready'; model: ReadyModel }
+  | { kind: 'editor'; editor: PresetEditorState };
 
 type Interaction =
   | { kind: 'browse' }
@@ -98,6 +118,10 @@ let settingsOpen = false;
 let noticeDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let notice: Notice | null = null;
 let loadToken = 0;
+let lastConsumedPresetEditorRequestAt: number | null = null;
+let presetEditorPollTimer: ReturnType<typeof setInterval> | null = null;
+let didReadPresetEditorRequestOnMount = false;
+let openingPresetEditor = false;
 
 const autoDismissNotice = (ms: number): void => {
   if (noticeDismissTimer) clearTimeout(noticeDismissTimer);
@@ -246,6 +270,199 @@ const readLayers = async (projectDirectory: string | null): Promise<LayersRead> 
   }
 
   return { status: 'ready', global: global.layer, project };
+};
+
+const formatPresetSourceValidation = (validation: PresetSourceValidation): string => {
+  if (validation.ok) return t('presetEditorValid');
+  if (validation.line !== undefined && validation.column !== undefined) {
+    return `${validation.message} (${t('presetSourceLocation', validation.line, validation.column)})`;
+  }
+  return validation.message;
+};
+
+type PresetEditorRequest = {
+  name: string;
+  at: number;
+};
+
+const isPresetEditorRequest = (value: unknown): value is PresetEditorRequest => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const request = value as Record<string, unknown>;
+  return typeof request.name === 'string'
+    && request.name.length > 0
+    && typeof request.at === 'number'
+    && Number.isFinite(request.at);
+};
+
+/** Writes the editor request and asks the host to reveal the rail panel. */
+const requestPresetEditor = async (model: ReadyModel): Promise<void> => {
+  if (openingPresetEditor) return;
+  openingPresetEditor = true;
+  let stored = false;
+  try {
+    await host.storage.set(PRESET_EDITOR_REQUEST_KEY, {
+      name: model.view.active.name,
+      at: Date.now(),
+    });
+    stored = true;
+    await host.openSurface('plugin:omo-preset');
+  } catch (error) {
+    if (stored) await host.storage.delete(PRESET_EDITOR_REQUEST_KEY).catch(() => undefined);
+    const code = error instanceof HostRequestError ? error.code : 'ERROR';
+    const detail = error instanceof Error ? error.message : String(error);
+    await host.toast({
+      kind: 'error',
+      message: t('presetEditorOpenFailed', code, detail),
+    }).catch(() => undefined);
+  } finally {
+    openingPresetEditor = false;
+  }
+};
+
+/** Opens the source editor for one known preset, always from the file on disk. */
+const openPresetEditor = async (model: ReadyModel, name: string): Promise<void> => {
+  const origin = model.view.origins[name];
+  if (!origin) {
+    notice = {
+      tone: 'error',
+      title: t('presetEditorPresetNotFound'),
+      body: name,
+    };
+    paint();
+    return;
+  }
+
+  const layer: PresetEditorLayer = origin === 'project' || origin === 'both' ? 'project' : 'global';
+  const parsedLayer = layer === 'project' ? model.project : model.global;
+  if (!parsedLayer) {
+    notice = {
+      tone: 'error',
+      title: t('presetEditorPresetNotFound'),
+      body: name,
+    };
+    paint();
+    return;
+  }
+
+  try {
+    const { content } = await host.readFile(parsedLayer.path);
+    screen = {
+      kind: 'editor',
+      editor: {
+        model,
+        layer,
+        presetName: name,
+        path: parsedLayer.path,
+        content,
+        original: content,
+        validation: validatePresetSource(content),
+        errorTitle: null,
+        error: null,
+        saving: false,
+      },
+    };
+    interaction = { kind: 'browse' };
+    listOpen = false;
+    notice = null;
+    paint();
+    requestAnimationFrame(() => root.querySelector<HTMLTextAreaElement>('.preset-source-content')?.focus());
+  } catch (error) {
+    const code = error instanceof HostRequestError ? error.code : 'ERROR';
+    const detail = error instanceof Error ? error.message : String(error);
+    notice = {
+      tone: 'error',
+      title: t('presetEditorOpenFailed', code, detail),
+    };
+    paint();
+  }
+};
+
+/** Leaves the editor and restores focus to the pencil beside the preset. */
+const closePresetEditor = (): void => {
+  if (screen.kind !== 'editor') return;
+  screen = { kind: 'ready', model: screen.editor.model };
+  interaction = { kind: 'browse' };
+  listOpen = false;
+  notice = null;
+  paint();
+  requestAnimationFrame(() => root.querySelector<HTMLElement>('.edit-preset-btn')?.focus());
+};
+
+/** Validates first, then writes. Invalid source never reaches host.writeFile. */
+const savePresetEditor = async (): Promise<void> => {
+  if (screen.kind !== 'editor') return;
+  const editor = screen.editor;
+  if (editor.saving) return;
+
+  const validation = validatePresetSource(editor.content);
+  editor.validation = validation;
+  if (!validation.ok) {
+    editor.errorTitle = t('presetEditorSaveFailed');
+    editor.error = `${formatPresetSourceValidation(validation)}. ${t('presetEditorNothingWritten')}`;
+    paint();
+    requestAnimationFrame(() => root.querySelector<HTMLTextAreaElement>('.preset-source-content')?.focus());
+    return;
+  }
+
+  editor.saving = true;
+  editor.errorTitle = null;
+  editor.error = null;
+  paint();
+  try {
+    await host.writeFile(editor.path, editor.content);
+    editor.original = editor.content;
+    await loadAndPaint();
+    notice = { tone: 'success', title: t('presetEditorSaved', editor.presetName) };
+    paint();
+    requestAnimationFrame(() => root.querySelector<HTMLElement>('.edit-preset-btn')?.focus());
+    autoDismissNotice(5000);
+  } catch (error) {
+    if (screen.kind !== 'editor') return;
+    screen.editor.saving = false;
+    screen.editor.errorTitle = error instanceof HostRequestError
+      && (error.code === 'DENIED' || error.code === 'NOT_GRANTED')
+      ? t('presetEditorWriteDenied')
+      : t('presetEditorSaveFailed');
+    screen.editor.error = errorText(error);
+    paint();
+  }
+};
+
+/** Reads and consumes one newer editor request from the status frame. */
+const consumePresetEditorRequest = async (): Promise<void> => {
+  const value = await host.storage.get(PRESET_EDITOR_REQUEST_KEY).catch(() => undefined);
+  if (!isPresetEditorRequest(value)) return;
+  const model = screen.kind === 'ready'
+    ? screen.model
+    : screen.kind === 'editor' ? screen.editor.model : null;
+  if (!model) return;
+  if (lastConsumedPresetEditorRequestAt !== null && value.at <= lastConsumedPresetEditorRequestAt) return;
+
+  lastConsumedPresetEditorRequestAt = value.at;
+  await host.storage.delete(PRESET_EDITOR_REQUEST_KEY).catch(() => undefined);
+  await openPresetEditor(model, value.name);
+};
+
+/**
+ * Keeps the rail panel aware of editor requests from the status frame. The
+ * interval lives in `mounted`, so the normal repaint lifecycle disposes it.
+ */
+const ensurePresetEditorPolling = (): void => {
+  if (surface === 'status' || presetEditorPollTimer !== null) return;
+  const timer = setInterval(() => {
+    void consumePresetEditorRequest();
+  }, PRESET_EDITOR_POLL_MS);
+  presetEditorPollTimer = timer;
+  mounted.push({
+    dispose: () => {
+      clearInterval(timer);
+      if (presetEditorPollTimer === timer) presetEditorPollTimer = null;
+    },
+  });
+  if (!didReadPresetEditorRequestOnMount) {
+    didReadPresetEditorRequestOnMount = true;
+    void consumePresetEditorRequest();
+  }
 };
 
 const scheduleHeight = (): void => {
@@ -1175,6 +1392,14 @@ const paintReady = (panel: HTMLElement, model: ReadyModel): void => {
 
   const activeRow = element('div', 'active-row');
   paintTrigger(activeRow, model, busy);
+  // The pencil also stays in the rail view so the editor can hand focus back.
+  const editPreset = element('button', 'icon-btn edit-preset-btn', '✎');
+  editPreset.type = 'button';
+  editPreset.title = t('editPresetInEditor');
+  editPreset.setAttribute('aria-label', t('editPresetInEditor'));
+  editPreset.disabled = busy;
+  editPreset.addEventListener('click', () => { void requestPresetEditor(model); });
+  activeRow.append(editPreset);
   if (model.view.projectPreset) {
     const clear = element('button', 'icon-btn clear-override', '×');
     clear.type = 'button';
@@ -1325,20 +1550,118 @@ const paintFailed = (panel: HTMLElement, failed: Extract<Screen, { kind: 'failed
   if (notice?.tone === 'success') paintBanner(panel, notice);
 };
 
+const paintPresetEditor = (panel: HTMLElement, editor: PresetEditorState): void => {
+  const container = element('section', 'preset-source-editor');
+  container.tabIndex = -1;
+  container.setAttribute('role', 'region');
+  container.setAttribute('aria-label', `${t('presetEditorTitle')}: ${editor.presetName}`);
+
+  const header = element('header', 'preset-source-header');
+  const identity = element('div', 'preset-source-identity');
+  identity.append(element('h1', 'preset-source-name', editor.presetName));
+  identity.append(element('div', 'preset-source-path', editor.path));
+
+  const state = element('div', 'preset-source-state');
+  const validationPill = element('span', 'preset-source-validation');
+  const back = element('button', 'icon-btn preset-source-back', '←');
+  back.type = 'button';
+  back.title = t('presetEditorBack');
+  back.setAttribute('aria-label', t('presetEditorBack'));
+  back.addEventListener('click', () => closePresetEditor());
+  state.append(validationPill, back);
+  header.append(identity, state);
+
+  if (editor.errorTitle && editor.error) {
+    mounted.push(mountBanner(container, {
+      tone: 'error',
+      title: editor.errorTitle,
+      body: editor.error,
+    }));
+  }
+
+  const textarea = element('textarea', 'preset-source-content');
+  textarea.value = editor.content;
+  textarea.spellcheck = false;
+  textarea.autocomplete = 'off';
+  textarea.setAttribute('aria-label', `${t('presetEditorTitle')}: ${editor.presetName}`);
+
+  const footer = element('div', 'preset-source-footer');
+  const save = element('button', 'editor-save preset-source-save', t('presetEditorSave'));
+  save.type = 'button';
+  save.addEventListener('click', () => { void savePresetEditor(); });
+  footer.append(save);
+
+  const updateValidation = (validation: PresetSourceValidation): void => {
+    validationPill.classList.toggle('is-valid', validation.ok);
+    validationPill.classList.toggle('is-invalid', !validation.ok);
+    if (validation.ok) {
+      validationPill.textContent = t('presetEditorValid');
+      validationPill.title = t('presetEditorValid');
+    } else {
+      const message = formatPresetSourceValidation(validation);
+      validationPill.textContent = `${t('presetEditorInvalid')} · ${message}`;
+      validationPill.title = message;
+    }
+    save.disabled = !validation.ok || editor.saving;
+  };
+
+  textarea.addEventListener('input', () => {
+    if (screen.kind !== 'editor') return;
+    screen.editor.content = textarea.value;
+    screen.editor.validation = validatePresetSource(textarea.value);
+    updateValidation(screen.editor.validation);
+  });
+
+  container.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closePresetEditor();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+      event.preventDefault();
+      event.stopPropagation();
+      void savePresetEditor();
+    }
+  });
+
+  updateValidation(editor.validation);
+  container.prepend(header);
+  container.append(textarea, footer);
+  panel.append(container);
+};
+
 const paint = (): void => {
   const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const focusedAgent = focused?.dataset.agent;
   const focusedSession = focused?.dataset.session;
+  const focusedSource = focused instanceof HTMLTextAreaElement && focused.classList.contains('preset-source-content')
+    ? focused
+    : null;
+  const sourceSelection = focusedSource
+    ? { start: focusedSource.selectionStart, end: focusedSource.selectionEnd }
+    : null;
   clearMounted();
   const panel = element('div', 'panel');
   if (screen.kind === 'loading') {
     paintLoading(panel);
   } else if (screen.kind === 'failed') {
     paintFailed(panel, screen);
+  } else if (screen.kind === 'editor') {
+    paintPresetEditor(panel, screen.editor);
   } else paintReady(panel, screen.model);
   root.append(panel);
-  if (focusedAgent) [...root.querySelectorAll<HTMLElement>('.agent-disclosure')].find((item) => item.dataset.agent === focusedAgent)?.focus();
-  else if (focusedSession) [...root.querySelectorAll<HTMLElement>('.session-option')].find((item) => item.dataset.session === focusedSession)?.focus();
+  if (focusedSource) {
+    const nextSource = root.querySelector<HTMLTextAreaElement>('.preset-source-content');
+    nextSource?.focus();
+    if (sourceSelection) nextSource?.setSelectionRange(sourceSelection.start, sourceSelection.end);
+  } else if (focusedAgent) {
+    [...root.querySelectorAll<HTMLElement>('.agent-disclosure')].find((item) => item.dataset.agent === focusedAgent)?.focus();
+  } else if (focusedSession) {
+    [...root.querySelectorAll<HTMLElement>('.session-option')].find((item) => item.dataset.session === focusedSession)?.focus();
+  }
+  ensurePresetEditorPolling();
   scheduleHeight();
 };
 
