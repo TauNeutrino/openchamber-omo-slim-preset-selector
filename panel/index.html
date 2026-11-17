@@ -897,6 +897,99 @@
       }
       .remove-prompt { font-size: 11px; color: var(--oc-warning, #f5a623); }
 
+      /* Source editor inside the rail panel. The header keeps the target file
+         and validation state visible while the textarea owns the space. */
+      .preset-source-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-height: calc(100vh - 24px);
+        min-width: 0;
+      }
+      .preset-source-header {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        min-width: 0;
+      }
+      .preset-source-identity { flex: 1 1 auto; min-width: 0; }
+      .preset-source-name {
+        margin: 0;
+        color: var(--oc-fg, #ddd);
+        font-size: 13px;
+        font-weight: 650;
+        line-height: 1.35;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .preset-source-path {
+        margin-top: 1px;
+        color: var(--oc-muted, #999);
+        font: 10px/1.4 var(--oc-mono, ui-monospace, monospace);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .preset-source-state {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        flex: 0 1 auto;
+        gap: 6px;
+        min-width: 0;
+      }
+      .preset-source-validation {
+        display: inline-flex;
+        align-items: center;
+        max-width: min(58vw, 520px);
+        padding: 2px 7px;
+        border: 1px solid transparent;
+        border-radius: 999px;
+        font-size: 10px;
+        font-weight: 600;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+      }
+      .preset-source-validation.is-valid {
+        border-color: color-mix(in srgb, var(--oc-success, #a6e3a1) 38%, transparent);
+        background: color-mix(in srgb, var(--oc-success, #a6e3a1) 12%, transparent);
+        color: var(--oc-success, #a6e3a1);
+      }
+      .preset-source-validation.is-invalid {
+        border-color: color-mix(in srgb, var(--oc-destructive, #f38ba8) 42%, transparent);
+        background: color-mix(in srgb, var(--oc-destructive, #f38ba8) 12%, transparent);
+        color: var(--oc-destructive, #f38ba8);
+        text-align: start;
+      }
+      .preset-source-content {
+        width: 100%;
+        flex: 1 1 auto;
+        min-height: 18em;
+        padding: 10px 11px;
+        border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.28));
+        border-radius: calc(var(--oc-radius, 8px) * 0.7);
+        background: var(--oc-card, rgba(127, 127, 127, 0.06));
+        color: var(--oc-fg, #ddd);
+        font: 12px/1.55 var(--oc-mono, ui-monospace, monospace);
+        tab-size: 2;
+        resize: vertical;
+        overflow: auto;
+      }
+      .preset-source-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 6px;
+      }
+      .preset-source-save:disabled { opacity: 0.45; cursor: default; }
+
+      @media (max-width: 520px) {
+        .preset-source-editor { min-height: calc(100vh - 20px); }
+        .preset-source-header { flex-wrap: wrap; }
+        .preset-source-state { width: 100%; justify-content: flex-start; }
+        .preset-source-validation { max-width: 100%; }
+      }
+
       /* Status surface: keep the editor short */
       .status-surface .agent-editor { gap: 6px; padding: 6px 8px; }
       .status-surface .editor-title { font-size: 12px; }
@@ -911,6 +1004,6 @@
   </head>
   <body>
     <div id="root"></div>
-    <script src="main.js?v=1.6.6"></script>
+    <script src="main.js?v=1.7.0"></script>
   </body>
 </html>
