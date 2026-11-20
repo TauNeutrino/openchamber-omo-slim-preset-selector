@@ -79,6 +79,51 @@ const isSessionActive = (session: AgentSession, now: number): boolean => {
     && now - session.updatedAt < ACTIVE_STALE_MS[session.activity];
 };
 
+/** Busy activities share OpenChamber's "working" state (running and retrying). */
+export const isTurnRunning = (session: AgentSession): boolean => (
+  session.activity === 'running' || session.activity === 'retrying'
+);
+
+/**
+ * Client-side turn anchors. The SDK exposes no turn start, so the panel can
+ * only time a turn it saw begin. `null` marks a turn that was already running
+ * when observation started: its age is unknown and must not be guessed.
+ */
+export type TurnStartTracker = {
+  /** At least one snapshot has been folded in. */
+  observed: boolean;
+  /** Session id → observed turn start in ms, or null when the start is unknown. */
+  starts: Map<string, number | null>;
+};
+
+export const emptyTurnStartTracker = (): TurnStartTracker => ({ observed: false, starts: new Map() });
+
+/**
+ * Folds one snapshot into the turn anchors.
+ *
+ * - not running → running: anchor = now (a new turn started between snapshots)
+ * - still running: keep the known anchor, including the null "unknown" marker
+ * - waiting, idle, finished, stale or gone: no anchor (the turn paused/ended)
+ * - first snapshot: running sessions get null, because their turn began before
+ *   the panel could observe the transition
+ */
+export const trackTurnStarts = (
+  tracker: TurnStartTracker,
+  sessions: readonly AgentSession[],
+  now: number,
+): TurnStartTracker => {
+  const starts = new Map<string, number | null>();
+  for (const session of sessions) {
+    if (!isSessionActive(session, now) || !isTurnRunning(session)) continue;
+    if (!tracker.observed) {
+      starts.set(session.id, null);
+      continue;
+    }
+    starts.set(session.id, tracker.starts.has(session.id) ? tracker.starts.get(session.id) ?? null : now);
+  }
+  return { observed: true, starts };
+};
+
 /** Finished sessions stay listed this long after their last update. */
 export const FINISHED_WINDOW_MS = 8 * 60 * 60 * 1000;
 

@@ -1,6 +1,8 @@
 /**
- * Dev-only preview for the per-agent editor. It copies the <style> block out of
- * panel/index.html and renders the editor states at 300 px and 380 px.
+ * Dev-only preview for the per-agent editor and its model/variant wizard. It
+ * copies the <style> block out of panel/index.html and renders the real markup
+ * shapes at 300 px and 380 px, so CSS/layout changes can be judged without the
+ * OpenChamber host.
  *
  *   node scripts/preview-editor.mjs && open preview/editor.html
  */
@@ -10,24 +12,19 @@ const panel = readFileSync(new URL('../panel/index.html', import.meta.url), 'utf
 const style = panel.slice(panel.indexOf('<style>') + 7, panel.indexOf('</style>'));
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
-const scopeLabel = (scope, preset) =>
-  scope === 'root' ? 'root agents' : `preset ${preset}`;
-
-const layerLabel = (layer) => (layer === 'global' ? 'Global' : 'This project');
-
-const destSegment = ({ groupLabel, nameA, nameB, selectedA }) => `
-  <span class="dest-segment" role="group" aria-label="${groupLabel}">
-    <button class="dest-btn${selectedA ? ' is-selected' : ''}" type="button" aria-pressed="${selectedA}">${nameA}</button>
-    <button class="dest-btn${selectedA ? '' : ' is-selected'}" type="button" aria-pressed="${!selectedA}">${nameB}</button>
-  </span>`;
-
 const destination = ({ agent, preset, scope, layer, path, warning }) => `
   <div class="editor-destination">
     <div class="editor-dest-row">
       <span class="editor-dest-label">Write to</span>
-      ${destSegment({ groupLabel: 'Scope', nameA: `preset ${preset}`, nameB: 'root agents', selectedA: scope === 'preset' })}
+      <span class="dest-segment" role="group" aria-label="Scope">
+        <button class="dest-btn${scope === 'preset' ? ' is-selected' : ''}" type="button" aria-pressed="${scope === 'preset'}">preset ${preset}</button>
+        <button class="dest-btn${scope === 'root' ? ' is-selected' : ''}" type="button" aria-pressed="${scope === 'root'}">root agents</button>
+      </span>
       <span class="editor-dest-label">in</span>
-      ${destSegment({ groupLabel: 'Layer', nameA: 'Global', nameB: 'This project', selectedA: layer === 'global' })}
+      <span class="dest-segment" role="group" aria-label="Layer">
+        <button class="dest-btn${layer === 'global' ? ' is-selected' : ''}" type="button" aria-pressed="${layer === 'global'}">Global</button>
+        <button class="dest-btn${layer === 'project' ? ' is-selected' : ''}" type="button" aria-pressed="${layer === 'project'}">This project</button>
+      </span>
     </div>
     <div class="editor-path" title="${path}">${path}</div>
     ${warning ? `
@@ -38,11 +35,12 @@ const destination = ({ agent, preset, scope, layer, path, warning }) => `
     </div>` : ''}
   </div>`;
 
-const chainItem = ({ model, variant, rank, isFirst, isLast }) => `
-  <div class="chain-item${rank === 1 ? ' is-primary' : ''}">
+/** Chain entry: model name opens the wizard at step 1, the variant chip at step 2. */
+const chainItem = ({ model, variant, rank, isFirst, isLast, flash }) => `
+  <div class="chain-item${rank === 1 ? ' is-primary' : ''}${flash ? ' is-flash' : ''}">
     <span class="chain-rank">${rank}</span>
     <span class="chain-model" title="${model}">${model}</span>
-    <input class="chain-variant" type="text" value="${variant}" placeholder="variant" aria-label="Variant for ${model}">
+    <button class="chain-variant${variant ? '' : ' is-empty'}" type="button" title="Edit variant · ${model}">${variant || 'Variante…'}</button>
     <span class="chain-actions">
       <button class="chain-btn" type="button" title="Move up"${isFirst ? ' disabled' : ''}>↑</button>
       <button class="chain-btn" type="button" title="Move down"${isLast ? ' disabled' : ''}>↓</button>
@@ -51,38 +49,7 @@ const chainItem = ({ model, variant, rank, isFirst, isLast }) => `
     </span>
   </div>`;
 
-const pickerRows = () => {
-  const models = [
-    { m: 'opencode-go/deepseek-v4.1-flash', variants: ['low', 'medium', 'high'] },
-    { m: 'opencode-go/kimi-k2.7-code', variants: ['low', 'medium', 'high', 'max'] },
-    { m: 'opencode-go/mimo-v2.5', variants: [] },
-    { m: 'opencode-go/gemini-4-argon', variants: ['high', 'max'] },
-  ];
-  return models.map(({ m, variants }) => {
-    const option = `
-      <button class="picker-option" type="button" title="${m}">
-        <span class="picker-option-text">${m}</span>
-      </button>`;
-    const vwrap = variants.length
-      ? `<span class="picker-variants">${variants.map((v) => `<button class="variant-pill" type="button" title="${m} (${v})">${v}</button>`).join('')}</span>`
-      : `<input class="variant-input" type="text" placeholder="variant" title="variant">`;
-    return `<div class="picker-row">${option}${vwrap}</div>`;
-  }).join('');
-};
-
-const picker = ({ title }) => `
-  <div class="model-picker editor-picker">
-    <div class="picker-head">
-      <span class="picker-title">${title}</span>
-      <button class="icon-btn" type="button" title="Close">×</button>
-    </div>
-    <div class="picker-filter">Filter: opencode</div>
-    <div class="picker-list">
-      ${pickerRows()}
-    </div>
-  </div>`;
-
-const chainSection = ({ chain, pickerOpen }) => `
+const chainSection = ({ chain }) => `
   <div class="editor-section">
     <button class="editor-section-title" type="button" aria-expanded="true">
       Model chain
@@ -97,11 +64,11 @@ const chainSection = ({ chain, pickerOpen }) => `
           rank: i + 1,
           isFirst: i === 0,
           isLast: i === arr.length - 1,
+          flash: entry.flash,
         })).join('')}
       </div>
       <button class="chain-add" type="button">+ Add fallback</button>
     </div>
-    ${pickerOpen ? picker({ title: 'Add fallback · 4 models' }) : ''}
   </div>`;
 
 const advancedFields = ({
@@ -212,12 +179,126 @@ const editor = (state) => `
   <div class="agent-editor" role="dialog" aria-label="Edit ${state.agent}" tabindex="-1">
     <div class="editor-head">
       <div class="editor-title">${state.agent}</div>
-      <div class="editor-subtitle">editing ${state.preset} · ${layerLabel(state.layer)}</div>
+      <div class="editor-subtitle">editing ${state.preset} · ${state.layer === 'global' ? 'Global' : 'This project'}</div>
     </div>
     ${destination(state)}
-    ${chainSection({ chain: state.chain, pickerOpen: state.pickerOpen })}
+    ${chainSection({ chain: state.chain })}
     ${advancedSection({ open: state.advancedOpen, fields: state.advanced ?? {} })}
     ${footer({ agent: state.agent, scope: state.scope, preset: state.preset, removeConfirm: state.removeConfirm })}
+  </div>`;
+
+/* ------------------------------------------------------------------ wizard */
+
+const STEP_LABELS = ['Model', 'Variant', 'Review'];
+const STEP_TITLES = ['Choose model', 'Choose variant', 'Review'];
+
+const wizardSteps = (step) => {
+  const current = ['model', 'variant', 'review'].indexOf(step);
+  return `<ol class="wizard-steps" aria-label="Steps">
+    ${STEP_LABELS.map((label, index) => `
+      <li class="${index === current ? 'is-current' : index < current ? 'is-done' : ''}"${index === current ? ' aria-current="step"' : ''}>
+        <span class="wizard-dot">${index < current ? '✓' : index + 1}</span>
+        <span class="wizard-step-label">${label}</span>
+      </li>`).join('')}
+  </ol>`;
+};
+
+const wizardCard = ({ mode, pos, step, body }) => `
+  <div class="agent-wizard" role="dialog" aria-label="oracle: ${STEP_TITLES[['model', 'variant', 'review'].indexOf(step)]}" tabindex="-1">
+    <div class="wizard-head">
+      <div class="wizard-titles">
+        <div class="wizard-kicker">${mode === 'replace' ? `Replace model · slot ${pos}` : `Add fallback · slot ${pos}`}</div>
+        <div class="wizard-title">${STEP_TITLES[['model', 'variant', 'review'].indexOf(step)]}</div>
+      </div>
+      <button class="icon-btn" type="button" title="Cancel">×</button>
+    </div>
+    ${wizardSteps(step)}
+    ${body}
+  </div>`;
+
+const modelRow = (id, state = '') => {
+  const blocked = state === 'blocked';
+  const current = state === 'current';
+  const tags = current
+    ? '<span class="wizard-tags"><span class="wizard-tag is-current">current</span></span>'
+    : blocked
+      ? '<span class="wizard-tags"><span class="wizard-tag">already in chain</span></span>'
+      : '';
+  return `<button class="wizard-model-row${current ? ' is-current' : ''}${blocked ? ' is-blocked' : ''}" type="button"${blocked ? ' disabled' : ''}>
+    <span class="wizard-model-name">${id}</span>${tags}
+  </button>`;
+};
+
+const wizardModelBody = () => `
+  <div class="wizard-body">
+    <p class="wizard-context">Replaces <code>github/gpt-5</code></p>
+    <input class="editor-input wizard-search" type="search" placeholder="Search models, e.g. glm or deepseek" aria-label="Search models">
+    <div class="wizard-models">
+      ${modelRow('opencode-go/deepseek-v4.1-flash')}
+      ${modelRow('opencode-go/gemini-4-argon')}
+      ${modelRow('github/gpt-5', 'current')}
+      ${modelRow('opencode-go/kimi-k2.7-code', 'blocked')}
+      ${modelRow('opencode-go/glm-5.3-flash', 'blocked')}
+      ${modelRow('opencode-go/mimo-v2.5')}
+      ${modelRow('opencode-go/beam-free')}
+      ${modelRow('opencode-go/qwen3.8-flash')}
+      ${modelRow('opencode/mimo-v2.6-flash-free')}
+      ${modelRow('nvidia/minimaxai/minimax-m3.1-flash')}
+      ${modelRow('magpie/agy-cli/gemini-4-argon')}
+      ${modelRow('opencode-go/claude-haiku-5-5')}
+    </div>
+  </div>`;
+
+const wizardVariantBody = () => `
+  <div class="wizard-body">
+    <p class="wizard-context">Model <code>github/gpt-5</code><button class="wizard-link" type="button">change</button></p>
+    <div class="wizard-variants" role="radiogroup" aria-label="Variant">
+      <button class="wizard-variant-option is-sans" type="button" role="radio" aria-checked="false">no variant</button>
+      <button class="wizard-variant-option" type="button" role="radio" aria-checked="false">low</button>
+      <button class="wizard-variant-option" type="button" role="radio" aria-checked="false">medium</button>
+      <button class="wizard-variant-option" type="button" role="radio" aria-checked="false">high</button>
+      <button class="wizard-variant-option" type="button" role="radio" aria-checked="false">xhigh <span class="wizard-bisher">previous</span></button>
+      <button class="wizard-variant-option is-sans" type="button" role="radio" aria-checked="true">
+        Custom variant …
+      </button>
+    </div>
+    <div class="wizard-custom">
+      <label class="editor-label" for="wizard-custom-variant">Custom variant</label>
+      <input class="editor-input wizard-custom-input" id="wizard-custom-variant" type="text" value="bad value" aria-invalid="true">
+      <p class="wizard-error">Only a–z, 0–9, dot and hyphen; at most 24 characters.</p>
+    </div>
+  </div>`;
+
+const wizardReviewBody = () => `
+  <div class="wizard-body">
+    <div class="wizard-target">
+      <span>Writes to</span>
+      <b>preset akita · Global</b>
+      <span class="wizard-path">~/.config/opencode/oh-my-opencode-slim.json</span>
+    </div>
+    <div class="wizard-diff">
+      <div class="wizard-diff-row is-old">
+        <span class="wizard-diff-label">Slot 1 · before</span>
+        <span class="wizard-diff-model">github/gpt-5</span>
+        <span class="variant">xhigh</span>
+      </div>
+      <div class="wizard-diff-row is-new">
+        <span class="wizard-diff-label">Slot 1 · after</span>
+        <span class="wizard-diff-model">opencode-go/deepseek-v4.1-flash</span>
+        <span class="variant">medium</span>
+      </div>
+    </div>
+    <div class="wizard-band">
+      <span class="wizard-band-title">Rest of the chain · unchanged</span>
+      <ol>
+        <li><span class="chain-rank">2</span><span class="wizard-band-model">opencode-go/kimi-k2.7-code</span><span class="variant">low</span></li>
+        <li><span class="chain-rank">3</span><span class="wizard-band-model">opencode-go/mimo-v2.5</span><span class="wizard-variant-none">none</span></li>
+      </ol>
+    </div>
+    <div class="wizard-footer">
+      <button class="editor-save wizard-apply" type="button">Apply</button>
+    </div>
+    <p class="wizard-note">Apply changes only this slot.</p>
   </div>`;
 
 const states = {
@@ -226,14 +307,13 @@ const states = {
     preset: 'akita',
     scope: 'preset',
     layer: 'global',
-    path: '~/.config/opencode/oh-my-opencode-slim.jsonc',
+    path: '~/.config/opencode/oh-my-opencode-slim.json',
     warning: false,
     chain: [
       { model: 'opencode-go/kimi-k2.7-code', variant: 'high' },
       { model: 'opencode-go/deepseek-v4.1-flash', variant: '' },
       { model: 'opencode-go/mimo-v2.5', variant: '' },
     ],
-    pickerOpen: false,
     advancedOpen: false,
     removeConfirm: false,
   },
@@ -242,27 +322,9 @@ const states = {
     preset: 'akita',
     scope: 'root',
     layer: 'project',
-    path: '.opencode/oh-my-opencode-slim.jsonc',
+    path: '.opencode/oh-my-opencode-slim.json',
     warning: true,
     chain: [{ model: 'opencode-go/deepseek-v4.1-flash', variant: 'medium' }],
-    pickerOpen: false,
-    advancedOpen: false,
-    removeConfirm: false,
-  },
-  fourModelChain: {
-    agent: 'oracle',
-    preset: 'akita',
-    scope: 'preset',
-    layer: 'global',
-    path: '~/.config/opencode/oh-my-opencode-slim.jsonc',
-    warning: false,
-    chain: [
-      { model: 'magpie/agy-cli/gemini-4-argon', variant: 'high' },
-      { model: 'opencode-go/deepseek-v4.1-flash', variant: 'medium' },
-      { model: 'opencode-go/kimi-k2.7-code', variant: 'low' },
-      { model: 'opencode-go/mimo-v2.5', variant: '' },
-    ],
-    pickerOpen: true,
     advancedOpen: false,
     removeConfirm: false,
   },
@@ -271,10 +333,9 @@ const states = {
     preset: 'akita',
     scope: 'preset',
     layer: 'project',
-    path: '.opencode/oh-my-opencode-slim.jsonc',
+    path: '.opencode/oh-my-opencode-slim.json',
     warning: false,
-    chain: [{ model: 'opencode-go/kimi-k2.7-code', variant: 'high' }],
-    pickerOpen: false,
+    chain: [{ model: 'opencode-go/kimi-k2.7-code', variant: 'high', flash: true }],
     advancedOpen: true,
     removeConfirm: false,
     advanced: {
@@ -309,8 +370,10 @@ const stack = () => `
   <div class="stack">
     ${section('preset + global', editor(states.presetGlobal))}
     ${section('root + project + warning', editor(states.rootProjectWarning))}
-    ${section('4-model chain + picker', editor(states.fourModelChain))}
-    ${section('advanced open', editor(states.advancedOpen))}
+    ${section('wizard · model (current + blocked)', wizardCard({ mode: 'replace', pos: 1, step: 'model', body: wizardModelBody() }))}
+    ${section('wizard · variant + custom error', wizardCard({ mode: 'replace', pos: 1, step: 'variant', body: wizardVariantBody() }))}
+    ${section('wizard · review diff', wizardCard({ mode: 'replace', pos: 1, step: 'review', body: wizardReviewBody() }))}
+    ${section('advanced open + applied flash', editor(states.advancedOpen))}
   </div>`;
 
 const html = `<!doctype html>

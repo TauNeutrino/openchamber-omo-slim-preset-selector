@@ -59,8 +59,15 @@ export const draftFromAgent = (agent: PresetAgent): AgentEditorDraft => {
     : permission === 'allow' || permission === 'ask' || permission === 'deny'
       ? permission
       : 'json';
+  const chain = agent.models.map((ref) => (ref.variant ? { ...ref } : { model: ref.model }));
+  // The agent-level `variant` key has no field of its own; it wins over the
+  // variant of the primary entry at runtime (see primaryVariant). Mirror it
+  // into that entry so the chain shows the value that actually runs and that a
+  // save would write, instead of an empty box next to a variant pill.
+  const agentVariant = agent.variant?.trim();
+  if (chain.length > 0 && agentVariant) chain[0] = { ...chain[0], variant: agentVariant };
   return {
-    chain: agent.models.map((ref) => (ref.variant ? { ...ref } : { model: ref.model })),
+    chain,
     variant: agent.variant ?? '',
     inherit: agent.inheritModelFrom ?? '',
     temperature: typeof agent.temperature === 'number' ? String(agent.temperature) : '',
@@ -120,13 +127,22 @@ export const patchFromDraft = (draft: AgentEditorDraft): DraftPatch => {
     temperature = value;
   }
 
+  // The primary chain entry is the only place the variant is editable, and the
+  // agent-level key outranks it. Keep the two in step: a value taken over from
+  // the fallback must not be dropped (that would delete the only visible
+  // variant), and clearing the entry must clear the key together with it.
+  const primaryVariant = (draft.chain[0]?.variant ?? '').trim();
+  const variant = draft.present.includes('variant')
+    ? (draft.chain.length > 0 ? (primaryVariant || null) : (draft.variant.trim() || null))
+    : (draft.variant.trim() || null);
+
   return {
     ok: true,
     patch: {
       models: draft.chain
         .map((ref) => (ref.variant ? { model: ref.model.trim(), variant: ref.variant.trim() } : { model: ref.model.trim() }))
         .filter((ref) => ref.model.length > 0),
-      variant: draft.variant.trim() ? draft.variant.trim() : null,
+      variant,
       inheritModelFrom: draft.inherit === '' ? null : draft.inherit,
       temperature,
       skills: listPatch(draft, 'skills', draft.skills),
@@ -165,3 +181,113 @@ export const setChainVariant = (
   const trimmed = variant.trim();
   return trimmed ? { model: ref.model, variant: trimmed } : { model: ref.model };
 });
+
+/** Variant names accepted by the wizard: lowercase, 1–24 chars, `.`/`-`/`_`. */
+const VARIANT_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,23}$/;
+
+export const normalizeVariantName = (raw: string): string | null => {
+  const value = raw.trim().toLowerCase();
+  return value !== '' && VARIANT_NAME_RE.test(value) ? value : null;
+};
+
+export const isValidVariantName = (raw: string): boolean => normalizeVariantName(raw) !== null;
+
+/** True when the model already sits in the chain somewhere other than `exceptIndex`. */
+export const chainContainsModel = (
+  chain: readonly PresetModelRef[],
+  model: string,
+  exceptIndex = -1,
+): boolean => chain.some((ref, index) => index !== exceptIndex && ref.model === model);
+
+/** Wizard state, shared by the panel and its tests. */
+export type EditorWizard = {
+  mode: 'replace' | 'add-fallback';
+  index: number;
+  step: 'model' | 'variant' | 'review';
+  model: string | null;
+  variantKind: 'none' | 'pick' | 'custom';
+  variant: string | null;
+  customText: string;
+  origModel: string | null;
+  origVariant: string | null;
+  /** Opened from the chain's variant control: the model may not be changed. */
+  lockedModel: boolean;
+};
+
+/** The chain entry the current wizard state describes. */
+export const wizardEntryOf = (wizard: EditorWizard): PresetModelRef | null => {
+  if (!wizard.model) return null;
+  if (wizard.variantKind === 'custom') {
+    const custom = normalizeVariantName(wizard.customText);
+    return custom ? { model: wizard.model, variant: custom } : null;
+  }
+  const variant = wizard.variantKind === 'pick' ? (wizard.variant ?? '').trim() : '';
+  return variant ? { model: wizard.model, variant } : { model: wizard.model };
+};
+
+/** A clicked model always advances to the variant step — there is no "next". */
+export const wizardChooseModel = (wizard: EditorWizard, model: string): EditorWizard => {
+  const same = wizard.mode === 'replace' && wizard.origModel === model && !!wizard.origVariant;
+  return {
+    ...wizard,
+    step: 'variant',
+    model,
+    variantKind: same ? 'pick' : 'none',
+    variant: same ? wizard.origVariant : null,
+    customText: '',
+  };
+};
+
+/** Picking "none" or a pill confirms it and advances to the review step. */
+export const wizardChooseVariant = (
+  wizard: EditorWizard,
+  kind: 'none' | 'pick',
+  variant: string | null,
+): EditorWizard => ({
+  ...wizard,
+  step: 'review',
+  variantKind: kind,
+  variant: kind === 'pick' ? variant : null,
+  customText: '',
+});
+
+/** A valid custom value advances to review; an invalid one keeps the step. */
+export const wizardCommitCustom = (wizard: EditorWizard, raw: string): EditorWizard | null => {
+  const normalized = normalizeVariantName(raw);
+  if (!normalized) return null;
+  return {
+    ...wizard,
+    step: 'review',
+    variantKind: 'custom',
+    variant: normalized,
+    customText: normalized,
+  };
+};
+
+/** True when applying the wizard would leave the replaced slot exactly as it is. */
+export const wizardIsUnchanged = (wizard: EditorWizard, chain: readonly PresetModelRef[]): boolean => {
+  if (wizard.mode !== 'replace') return false;
+  const entry = wizardEntryOf(wizard);
+  const current = chain[wizard.index];
+  return !!entry && !!current
+    && current.model === entry.model
+    && (current.variant ?? '') === (entry.variant ?? '');
+};
+
+/** Applies the wizard to the chain; null when incomplete or a duplicate. */
+export const wizardApply = (
+  wizard: EditorWizard,
+  chain: readonly PresetModelRef[],
+): { chain: PresetModelRef[]; index: number } | null => {
+  const entry = wizardEntryOf(wizard);
+  if (!entry) return null;
+  if (wizard.mode === 'replace') {
+    if (wizard.index < 0 || wizard.index >= chain.length) return null;
+    const next = [...chain];
+    next[wizard.index] = entry;
+    return { chain: next, index: wizard.index };
+  }
+  // A chain with the same model twice is pointless; keep the first entry.
+  if (chainContainsModel(chain, entry.model)) return null;
+  return { chain: [...chain, entry], index: chain.length };
+};

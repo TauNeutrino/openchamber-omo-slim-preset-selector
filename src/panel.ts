@@ -29,14 +29,22 @@ import {
   type PresetView,
 } from './config.ts';
 import {
+  chainContainsModel,
   draftFromAgent,
+  isValidVariantName,
   moveInChain,
   patchFromDraft,
   removeFromChain,
-  setChainVariant,
+  wizardApply,
+  wizardChooseModel,
+  wizardChooseVariant,
+  wizardCommitCustom,
+  wizardEntryOf,
+  wizardIsUnchanged,
   type AgentEditorDraft,
+  type EditorWizard,
 } from './agent-editor.ts';
-import { countGlyph, groupAgentSessions, sameDirectory, type AgentSession, type AgentSessionGroups } from './sessions.ts';
+import { countGlyph, emptyTurnStartTracker, groupAgentSessions, sameDirectory, trackTurnStarts, type AgentSession, type AgentSessionGroups } from './sessions.ts';
 import { validatePresetSource, type PresetSourceValidation } from './preset-source.ts';
 
 import { setLocale, t } from './i18n.ts';
@@ -58,7 +66,14 @@ const PRESET_EDITOR_REQUEST_KEY = 'presetEditorRequest';
 const PRESET_EDITOR_POLL_MS = 1500;
 const restartHint = (): string => t('restartHint');
 
-type Notice = { tone: Extract<Tone, 'success' | 'warning' | 'error' | 'info'>; title: string; body?: string };
+type Notice = {
+  tone: Extract<Tone, 'success' | 'warning' | 'error' | 'info'>;
+  title: string;
+  body?: string;
+  restart?: boolean;
+  /** The CTA asked once already; only this confirm block may run the kill. */
+  restartConfirm?: boolean;
+};
 
 type ReadyModel = {
   global: ParsedLayer;
@@ -116,7 +131,12 @@ let interaction: Interaction = { kind: 'browse' };
 let listOpen = false;
 let settingsOpen = false;
 let noticeDismissTimer: ReturnType<typeof setTimeout> | null = null;
+let noticeExpiresAt = 0;
+let noticeHovering = false;
 let notice: Notice | null = null;
+/** Active wait for the restarted OpenCode; paint re-arms its timer. */
+let restartPoll: { startedAt: number; title: string } | null = null;
+let restartPollTimer: ReturnType<typeof setTimeout> | null = null;
 let loadToken = 0;
 let lastConsumedPresetEditorRequestAt: number | null = null;
 let presetEditorPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -124,10 +144,22 @@ let didReadPresetEditorRequestOnMount = false;
 let openingPresetEditor = false;
 
 const autoDismissNotice = (ms: number): void => {
+  if (!notice) return;
+  // The confirm step waits for an explicit choice; there is no timeout there.
+  if (notice.restartConfirm) return;
   if (noticeDismissTimer) clearTimeout(noticeDismissTimer);
+  const scheduled = notice;
+  noticeExpiresAt = Date.now() + ms;
+  // Only the notice that was scheduled goes away; a replacement (e.g. an
+  // error raised meanwhile) stays until its own timer or the × button.
+  // Hovering over the banner pauses the countdown (see paintBanner).
   noticeDismissTimer = setTimeout(() => {
     noticeDismissTimer = null;
-    if (notice?.tone === 'success') {
+    if (noticeHovering) {
+      autoDismissNotice(Math.max(1000, noticeExpiresAt - Date.now()));
+      return;
+    }
+    if (notice === scheduled) {
       notice = null;
       paint();
     }
@@ -150,6 +182,8 @@ let finishedWindowHours = 8;
 let presetEditingEnabled = false;
 /** Last session snapshot as delivered by the host, for regrouping when the window changes. */
 let lastSessionSnapshot: { records: AgentSession[]; projectId: string; directory: string; sessionId: string | null } | null = null;
+/** Observed turn starts per session; the SDK has no turn start of its own. */
+let turnStarts = emptyTurnStartTracker();
 /** Model picker state when preset editing is enabled. */
 type AgentEditor = {
   agent: string;
@@ -158,23 +192,26 @@ type AgentEditor = {
   draft: AgentEditorDraft;
   chainOpen: boolean;
   advancedOpen: boolean;
-  pickerMode: null | 'replace-primary' | 'add-fallback';
-  pickerIndex: number;
+  wizard: EditorWizard | null;
   removeConfirm: boolean;
 };
 let agentEditor: AgentEditor | null = null;
-let pickerFilter = '';
-let pickerAppliedFilter = '';
-let pickerDebounce: ReturnType<typeof setTimeout> | 0 = 0;
+let wizardFilter = '';
+let wizardScrollPending = false;
+let wizardFocusCustom = false;
+/** Chain entry to flash once after the wizard applied a change. */
+let chainFlash: { index: number; until: number } | null = null;
 let modelCatalog: string[] = [];
 let modelVariants: Record<string, string[]> = {};
 let cloneState: { source: string; scope: 'global' | 'project' | null; name: string } | null = null;
 
 const regroupSessions = (): void => {
   if (!lastSessionSnapshot) return;
+  const now = Date.now();
+  turnStarts = trackTurnStarts(turnStarts, lastSessionSnapshot.records, now);
   const next = groupAgentSessions(
     lastSessionSnapshot.records, lastSessionSnapshot.projectId, lastSessionSnapshot.directory,
-    Date.now(), finishedWindowHours * 60 * 60 * 1000, lastSessionSnapshot.sessionId,
+    now, finishedWindowHours * 60 * 60 * 1000, lastSessionSnapshot.sessionId,
   );
   agentSessions = next;
   if (openAgent !== undefined && !next.has(openAgent)) openAgent = undefined;
@@ -412,10 +449,10 @@ const savePresetEditor = async (): Promise<void> => {
     await host.writeFile(editor.path, editor.content);
     editor.original = editor.content;
     await loadAndPaint();
-    notice = { tone: 'success', title: t('presetEditorSaved', editor.presetName) };
+    notice = { tone: 'warning', title: t('presetEditorSaved', editor.presetName), body: restartHint(), restart: true };
     paint();
+    autoDismissNotice(15000);
     requestAnimationFrame(() => root.querySelector<HTMLElement>('.edit-preset-btn')?.focus());
-    autoDismissNotice(5000);
   } catch (error) {
     if (screen.kind !== 'editor') return;
     screen.editor.saving = false;
@@ -482,15 +519,258 @@ const clearMounted = (): void => {
   root.replaceChildren();
 };
 
+/**
+ * Fallback for hosts where the service restart is unavailable (web client,
+ * service not granted): open the settings page that has the restart button
+ * (`/?settings=general`). The frame shares the server's origin, and
+ * `host.openUrl` routes a loopback address to the desktop browser panel, a
+ * remote one to the system browser.
+ */
+const openRestartSettings = async (): Promise<void> => {
+  try {
+    // The frame is a sandboxed iframe: `location.origin` reads "null" there,
+    // so derive the app origin from the frame's own address instead.
+    const frameUrl = new URL(globalThis.location.href);
+    const target = new URL('/', frameUrl.origin);
+    target.searchParams.set('settings', 'general');
+    await host.openUrl(target.toString());
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    await host.toast({ kind: 'info', message: `${t('restartOpenFailed')} · ${detail}` }).catch(() => undefined);
+  }
+};
+
+const RESTART_POLL_MS = 3000;
+const RESTART_TIMEOUT_MS = 60_000;
+
+const stopRestartPoll = (): void => {
+  if (restartPollTimer) {
+    clearTimeout(restartPollTimer);
+    restartPollTimer = null;
+  }
+  restartPoll = null;
+};
+
+/** Polls GET /models until OpenCode answers again, then shows the success note. */
+const pollRestart = async (): Promise<void> => {
+  const poll = restartPoll;
+  if (!poll) return;
+  try {
+    // Force a real CLI run: the service cache would answer instantly while the
+    // managed process is still down.
+    const result = await host.serviceRequest({ method: 'GET', path: '/models?refresh=true' });
+    if (result.status === 200) {
+      const answer = JSON.parse(result.body) as { ok?: boolean; catalog?: unknown; variants?: unknown };
+      if (answer.ok && Array.isArray(answer.catalog) && answer.catalog.length > 0) {
+        if (restartPoll !== poll) return;
+        modelCatalog = answer.catalog as string[];
+        modelVariants = (answer as { variants?: Record<string, string[]> }).variants ?? {};
+        stopRestartPoll();
+        notice = { tone: 'success', title: t('restartDone') };
+        paint();
+        autoDismissNotice(15000);
+        return;
+      }
+    }
+  } catch {
+    // Still down (or the service request failed); keep waiting until the deadline.
+  }
+  if (restartPoll !== poll) return;
+  if (Date.now() - poll.startedAt >= RESTART_TIMEOUT_MS) {
+    stopRestartPoll();
+    notice = { tone: 'warning', title: poll.title, body: restartHint(), restart: true };
+    paint();
+    autoDismissNotice(15000);
+    return;
+  }
+  scheduleRestartPoll();
+};
+
+/**
+ * Arms the next poll. The handle lives in `mounted`, i.e. it is disposed with
+ * the render; `paintBanner` re-arms it on every paint, so a repaint cannot
+ * strand the wait and a closed notice cannot leak a timer.
+ */
+const scheduleRestartPoll = (): void => {
+  if (!restartPoll || restartPollTimer) return;
+  const remaining = RESTART_TIMEOUT_MS - (Date.now() - restartPoll.startedAt);
+  if (remaining <= 0) {
+    const poll = restartPoll;
+    stopRestartPoll();
+    notice = { tone: 'warning', title: poll.title, body: restartHint(), restart: true };
+    paint();
+    autoDismissNotice(15000);
+    return;
+  }
+  const timer = setTimeout(() => {
+    restartPollTimer = null;
+    void pollRestart();
+  }, Math.min(RESTART_POLL_MS, remaining));
+  restartPollTimer = timer;
+  mounted.push({
+    dispose: () => {
+      if (restartPollTimer === timer) {
+        clearTimeout(timer);
+        restartPollTimer = null;
+      }
+    },
+  });
+};
+
+/** First CTA click: ask before killing every running session. */
+const enterRestartConfirm = (): void => {
+  if (!notice) return;
+  notice = { ...notice, restart: true, restartConfirm: true };
+  clearNoticeDismissTimer();
+  paint();
+};
+
+const cancelRestartConfirm = (): void => {
+  if (!notice) return;
+  notice = { ...notice, restart: true, restartConfirm: false };
+  paint();
+  autoDismissNotice(15000);
+};
+
+/** The confirmed CTA: call the service, then wait for the catalog to return. */
+const startOpenCodeRestart = async (): Promise<void> => {
+  const current = notice;
+  if (!current) return;
+  const fallbackTitle = current.title;
+  stopRestartPoll();
+  notice = { tone: 'warning', title: t('restartInProgress'), restart: false, restartConfirm: false };
+  restartPoll = { startedAt: Date.now(), title: fallbackTitle };
+  paint();
+  try {
+    const result = await host.serviceRequest({ method: 'POST', path: '/restart-opencode' });
+    let answer: { ok?: boolean; error?: unknown; killed?: unknown } = {};
+    try {
+      answer = JSON.parse(result.body) as typeof answer;
+    } catch {
+      // The status still decides below.
+    }
+    if (result.status === 409 || answer.error === 'external') {
+      stopRestartPoll();
+      notice = { tone: 'warning', title: t('restartExternal'), body: restartHint(), restart: false };
+      paint();
+      autoDismissNotice(15000);
+      void openRestartSettings();
+      void host.toast({ kind: 'info', message: t('restartExternal') }).catch(() => undefined);
+      return;
+    }
+    if (result.status !== 200 || !answer.ok) {
+      throw new Error(typeof answer.error === 'string' ? answer.error : t('serviceHttpError', result.status));
+    }
+    // OpenChamber restarts the process itself; the poll takes over from here.
+    scheduleRestartPoll();
+  } catch (error) {
+    stopRestartPoll();
+    notice = { tone: 'warning', title: fallbackTitle, body: restartHint(), restart: true };
+    paint();
+    autoDismissNotice(15000);
+    const detail = errorText(error);
+    void openRestartSettings();
+    void host.toast({ kind: 'info', message: `${t('restartFailed')} · ${detail}` }).catch(() => undefined);
+  }
+};
+
 const paintBanner = (parent: Element, value: Notice): void => {
   mounted.push(mountBanner(parent, {
     tone: value.tone,
     title: value.title,
     body: value.body,
+    action: value.restart && !value.restartConfirm
+      ? { label: t('restartNow'), onClick: enterRestartConfirm }
+      : undefined,
   }));
+  // The restart CTA fills the SDK banner's single action slot; the × control
+  // is a separate, absolutely positioned button in the banner's top-right
+  // corner. Hovering over the banner pauses the auto-dismiss countdown.
+  const bannerNode = parent.lastElementChild as HTMLElement | null;
+  if (bannerNode) {
+    const closeWrap = document.createElement('span');
+    closeWrap.className = 'banner-close';
+    const close = mountButton(closeWrap, {
+      label: '×',
+      variant: 'ghost',
+      size: 'xs',
+      onClick: () => {
+        clearNoticeDismissTimer();
+        stopRestartPoll();
+        notice = null;
+        paint();
+      },
+    });
+    bannerNode.append(closeWrap);
+    mounted.push(close);
+    const enter = (): void => {
+      noticeHovering = true;
+      if (noticeDismissTimer) {
+        clearTimeout(noticeDismissTimer);
+        noticeDismissTimer = null;
+      }
+    };
+    const leave = (): void => {
+      noticeHovering = false;
+      if (notice?.restartConfirm) return;
+      const left = noticeExpiresAt - Date.now();
+      if (notice !== null && left > 0) autoDismissNotice(left);
+    };
+    bannerNode.addEventListener('mouseenter', enter);
+    bannerNode.addEventListener('mouseleave', leave);
+    mounted.push({
+      dispose: () => {
+        bannerNode.removeEventListener('mouseenter', enter);
+        bannerNode.removeEventListener('mouseleave', leave);
+      },
+    });
+    if (value.restart && value.restartConfirm) {
+      const text = bannerNode.querySelector<HTMLElement>('.oc-sdk-banner-text');
+      if (text) {
+        const confirm = element('div', 'confirm-warning');
+        confirm.append(element('div', 'confirm-warning-text', t('restartConfirmText')));
+        const actions = element('div', 'confirm-actions');
+        const cancel = mountButton(actions, {
+          label: t('cancel'),
+          variant: 'ghost',
+          size: 'xs',
+          onClick: cancelRestartConfirm,
+        });
+        const go = mountButton(actions, {
+          label: t('restartConfirmCta'),
+          variant: 'destructive',
+          size: 'xs',
+          onClick: () => { void startOpenCodeRestart(); },
+        });
+        confirm.append(actions);
+        text.append(confirm);
+        mounted.push(cancel, go);
+      }
+    }
+    // Repaints dispose `mounted`; re-arm the poll timer on the fresh render.
+    scheduleRestartPoll();
+  }
 };
 
 const auditForReadyScreen = (): ModelAudit | null => (modelCheck.kind === 'done' ? modelCheck.audit : null);
+
+type SessionLineTone = 'warning' | 'info' | 'error' | 'success' | 'unknown';
+
+/** Status of one session row, mirroring the OpenChamber Work Status mapping. */
+const sessionLineStatus = (session: AgentSession, done: boolean): { glyph: string; tone: SessionLineTone; label: string } => {
+  if (done) {
+    if (session.outcome === 'failed') return { glyph: '×', tone: 'error', label: t('sessionFailed') };
+    if (session.outcome === 'completed') return { glyph: '✓', tone: 'success', label: t('sessionDone') };
+    return { glyph: '◷', tone: 'unknown', label: '' };
+  }
+  switch (session.activity) {
+    case 'waiting-permission': return { glyph: '!', tone: 'warning', label: t('waitingForApproval') };
+    case 'waiting-question': return { glyph: '!', tone: 'warning', label: t('waitingForAnswer') };
+    case 'retrying': return { glyph: '◉', tone: 'info', label: t('retrying') };
+    case 'running': return { glyph: '◉', tone: 'info', label: t('sessionWorking') };
+    default: return { glyph: '◷', tone: 'unknown', label: '' };
+  }
+};
 
 const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetAgent) => void): HTMLElement => {
   const key = agent.agent;
@@ -589,23 +869,32 @@ const agentRow = (agent: PresetAgent, editable: boolean, onEdit: (agent: PresetA
       const open = element('button', 'session-open');
       open.type = 'button';
       const label = element('span', 'session-title', session.title || t('sessionWithoutTitle'));
-      open.title = session.title;
-      open.append(label);
+      const status = sessionLineStatus(session, done);
+      const marker = element('span', `session-status is-${status.tone}`, status.glyph);
+      marker.setAttribute('aria-hidden', 'true');
+      open.append(marker, label);
+      if (status.label) open.append(element('span', `session-state is-${status.tone}`, status.label));
+      const now = Date.now();
       if (done) {
-        const outcome = session.outcome === 'completed' ? '✓'
-          : session.outcome === 'failed' ? '×' : '';
-        const when = relativeTime(session.updatedAt);
-        open.append(element('span', 'session-activity', outcome ? `${outcome} ${when}` : when));
+        // OpenChamber shows no duration for a finished turn; the age stays in
+        // the tooltip instead of occupying the value column.
+        open.title = `${session.title || t('sessionWithoutTitle')} — ${relativeTime(session.updatedAt)}`;
       } else {
-        const activity = session.activity === 'waiting-permission' ? t('waitingForApproval')
-          : session.activity === 'waiting-question' ? t('waitingForAnswer')
-            : session.activity === 'retrying' ? t('retrying') : '';
-        if (activity) open.append(element('span', 'session-activity', activity));
-        const elapsed = element('span', 'session-activity is-live');
-        elapsed.dataset.elapsedStart = String(session.createdAt);
-        elapsed.textContent = formatDuration(Date.now() - session.createdAt);
-        elapsed.title = t('runtimeSinceCreation');
-        open.append(elapsed);
+        const anchor = turnStarts.starts.get(session.id);
+        if (typeof anchor === 'number') {
+          const elapsed = element('span', 'session-activity is-live');
+          elapsed.dataset.elapsedStart = String(anchor);
+          elapsed.textContent = formatDuration(now - anchor);
+          open.append(elapsed);
+          open.title = `${session.title || t('sessionWithoutTitle')} — ${t(
+            'sessionRuntimeTitle', formatDuration(now - session.createdAt), formatDuration(now - anchor),
+          )}`;
+        } else {
+          // A turn already running when the panel opened has no observed start.
+          open.title = `${session.title || t('sessionWithoutTitle')} — ${t(
+            'sessionRuntimeUnknownTitle', formatDuration(now - session.createdAt),
+          )}`;
+        }
       }
       open.addEventListener('click', () => {
         openSession(session.id);
@@ -685,10 +974,84 @@ const editorTextInput = (
   return input;
 };
 
+/** Known variants of a model: the service catalog, with the same heuristic the picker uses. */
+const variantsForModel = (model: string): string[] => {
+  const reported = modelVariants[model] ?? [];
+  if (reported.length > 0) return reported;
+  return model.startsWith('opencode/') || model.startsWith('opencode-go/')
+    ? ['low', 'medium', 'high', 'xhigh', 'max']
+    : [];
+};
+
+/**
+ * The variant control of one chain entry: a compact value that opens the
+ * wizard's variant step for this entry. It is the only place variants are
+ * edited, so the chain itself stays a pure display.
+ */
+const chainVariantControl = (ref: PresetModelRef, index: number): HTMLElement => {
+  const value = ref.variant ?? '';
+  const button = element('button', value ? 'chain-variant' : 'chain-variant is-empty');
+  button.type = 'button';
+  button.textContent = value || t('wizardVariantPlaceholder');
+  button.title = t('wizardEditVariant', ref.model);
+  button.setAttribute('aria-label', t('wizardEditVariant', ref.model));
+  button.addEventListener('click', () => {
+    if (!agentEditor) return;
+    agentEditor.wizard = {
+      mode: 'replace',
+      index,
+      step: 'variant',
+      model: ref.model,
+      variantKind: value ? 'pick' : 'none',
+      variant: value || null,
+      customText: '',
+      origModel: ref.model,
+      origVariant: value || null,
+      lockedModel: true,
+    };
+    wizardFilter = '';
+    wizardFocusCustom = false;
+    paint();
+  });
+  return button;
+};
+
+/** Step heading shown in the wizard header. */
+const wizardStepTitle = (step: EditorWizard['step']): string => (
+  step === 'model' ? t('wizardStepModel') : step === 'variant' ? t('wizardStepVariant') : t('wizardStepReview')
+);
+
+const wizardStepShort = (step: EditorWizard['step']): string => (
+  step === 'model' ? t('wizardStepModelShort') : step === 'variant' ? t('wizardStepVariantShort') : t('wizardStepReviewShort')
+);
+
+/** Applies a wizard result to the draft, mirrors the agent-level key, and closes it. */
+const applyAgentWizard = (): void => {
+  const editor = agentEditor;
+  const wizard = editor?.wizard;
+  if (!editor || !wizard) return;
+  const applied = wizardApply(wizard, editor.draft.chain);
+  if (!applied) return;
+  editor.draft.chain = applied.chain;
+  // Bug-1 semantics: the primary entry owns the agent-level key when present.
+  if (applied.index === 0 && editor.draft.present.includes('variant')) {
+    editor.draft.variant = applied.chain[0]?.variant ?? '';
+  }
+  chainFlash = { index: applied.index, until: Date.now() + 1600 };
+  editor.wizard = null;
+  wizardFilter = '';
+  wizardFocusCustom = false;
+  paint();
+};
+
 /** The per-agent editor: destination, fallback chain, advanced keys, footer. */
 const paintAgentEditor = (panel: HTMLElement, model: ReadyModel): void => {
   const editor = agentEditor;
   if (!editor) return;
+  if (editor.wizard) {
+    paintAgentWizard(panel, model);
+    return;
+  }
   const draft = editor.draft;
   const card = element('div', 'agent-editor');
   card.tabIndex = -1;
@@ -758,31 +1121,33 @@ const paintAgentEditor = (panel: HTMLElement, model: ReadyModel): void => {
     } else {
       const list = element('div', 'chain-list');
       draft.chain.forEach((ref, index) => {
-        const item = element('div', index === 0 ? 'chain-item is-primary' : 'chain-item');
+        const flash = chainFlash !== null && chainFlash.index === index && Date.now() < chainFlash.until;
+        const item = element('div', (index === 0 ? 'chain-item is-primary' : 'chain-item') + (flash ? ' is-flash' : ''));
         item.append(element('span', 'chain-rank', String(index + 1)));
         const name = element('span', 'chain-model', ref.model);
         name.title = `${t('editorReplaceModel')} · ${ref.model}`;
         name.style.cursor = 'pointer';
         name.addEventListener('click', () => {
           if (!agentEditor) return;
-          agentEditor.pickerMode = 'replace-primary';
-          agentEditor.pickerIndex = index;
-          pickerFilter = '';
-          pickerAppliedFilter = '';
+          agentEditor.wizard = {
+            mode: 'replace',
+            index,
+            step: 'model',
+            model: null,
+            variantKind: 'none',
+            variant: null,
+            customText: '',
+            origModel: ref.model,
+            origVariant: ref.variant ?? null,
+            lockedModel: false,
+          };
+          wizardFilter = '';
+          wizardScrollPending = true;
+          wizardFocusCustom = false;
           paint();
         });
         item.append(name);
-        const variant = document.createElement('input');
-        variant.type = 'text';
-        variant.className = 'chain-variant';
-        variant.value = ref.variant ?? '';
-        variant.placeholder = 'variant';
-        variant.setAttribute('aria-label', t('editorChainVariant', ref.model));
-        variant.addEventListener('change', () => {
-          if (!agentEditor) return;
-          agentEditor.draft.chain = setChainVariant(agentEditor.draft.chain, index, variant.value);
-        });
-        item.append(variant);
+        item.append(chainVariantControl(ref, index));
         const actions = element('span', 'chain-actions');
         const actionButton = (glyph: string, label: string, disabled: boolean, onClick: () => void, remove = false): HTMLElement => {
           const button = element('button', remove ? 'chain-btn is-remove' : 'chain-btn', glyph);
@@ -824,79 +1189,27 @@ const paintAgentEditor = (panel: HTMLElement, model: ReadyModel): void => {
     add.type = 'button';
     add.addEventListener('click', () => {
       if (!agentEditor) return;
-      agentEditor.pickerMode = 'add-fallback';
-      pickerFilter = '';
-      pickerAppliedFilter = '';
+      agentEditor.wizard = {
+        mode: 'add-fallback',
+        index: agentEditor.draft.chain.length,
+        step: 'model',
+        model: null,
+        variantKind: 'none',
+        variant: null,
+        customText: '',
+        origModel: null,
+        origVariant: null,
+        lockedModel: false,
+      };
+      wizardFilter = '';
+      wizardScrollPending = false;
+      wizardFocusCustom = false;
       paint();
     });
     body.append(add);
     chainSection.append(body);
   }
   card.append(chainSection);
-
-  // Embedded model search, shown only while adding/replacing.
-  if (editor.pickerMode) {
-    const box = element('div', 'model-picker editor-picker');
-    const boxHead = element('div', 'picker-head');
-    const title = editor.pickerMode === 'add-fallback' ? t('chainAddTitle') : t('chainReplaceTitle');
-    boxHead.append(element('span', 'picker-title', `${title} · ${modelCatalog.length}`));
-    const close = element('button', 'icon-btn', '×');
-    close.type = 'button';
-    close.title = t('cancel');
-    close.addEventListener('click', () => {
-      if (!agentEditor) return;
-      agentEditor.pickerMode = null;
-      paint();
-    });
-    boxHead.append(close);
-    box.append(boxHead);
-
-    const list = element('div', 'picker-list');
-    const fillList = (filterText: string): void => {
-      list.replaceChildren();
-      const filter = filterText.trim().toLowerCase();
-      const items = modelCatalog.filter((entry) => !filter || entry.toLowerCase().includes(filter));
-      if (items.length === 0) {
-        list.append(element('div', 'picker-empty', modelCatalog.length === 0 ? t('modelCheckLabel') : t('noModelsMatchingFilter')));
-        return;
-      }
-      for (const entry of items) {
-        const row = element('div', 'picker-row');
-        const option = element('button', 'picker-option');
-        option.type = 'button';
-        option.title = entry;
-        option.append(element('span', 'picker-option-text', entry));
-        option.addEventListener('click', () => applyEditorPick(entry));
-        row.append(option);
-        const reported = modelVariants[entry] ?? [];
-        const variants = reported.length ? reported : (entry.startsWith('opencode/') || entry.startsWith('opencode-go/')) ? ['low', 'medium', 'high', 'xhigh', 'max'] : [];
-        if (variants.length) {
-          const wrap = element('span', 'picker-variants');
-          for (const variant of variants) {
-            const pill = element('button', 'variant-pill', variant);
-            pill.type = 'button';
-            pill.title = `${entry} (${variant})`;
-            pill.addEventListener('click', (event) => {
-              event.stopPropagation();
-              applyEditorPick(entry, variant);
-            });
-            wrap.append(pill);
-          }
-          row.append(wrap);
-        }
-        list.append(row);
-      }
-    };
-    const search = editorTextInput('editor-model-search', pickerFilter, t('filterModels'), (value) => {
-      pickerFilter = value;
-      // Filter in place: a full repaint would steal the caret from the field.
-      fillList(value);
-    });
-    box.append(search);
-    fillList(pickerAppliedFilter);
-    box.append(list);
-    card.append(box);
-  }
 
   // Advanced keys, collapsed unless the user opens them.
   const advanced = element('div', 'editor-section');
@@ -1071,6 +1384,326 @@ const paintAgentEditor = (panel: HTMLElement, model: ReadyModel): void => {
   card.append(footer);
 
   panel.append(card);
+};
+
+/** The three wizard steps, read-only; there is no "next" button. */
+const wizardSteps = (current: EditorWizard['step']): HTMLElement => {
+  const order: EditorWizard['step'][] = ['model', 'variant', 'review'];
+  const list = element('ol', 'wizard-steps');
+  list.setAttribute('aria-label', t('wizardSteps'));
+  const currentIndex = order.indexOf(current);
+  order.forEach((step, index) => {
+    const li = element('li', index === currentIndex ? 'is-current' : index < currentIndex ? 'is-done' : '');
+    if (index === currentIndex) li.setAttribute('aria-current', 'step');
+    li.append(element('span', 'wizard-dot', index < currentIndex ? '✓' : String(index + 1)));
+    li.append(element('span', 'wizard-step-label', wizardStepShort(step)));
+    list.append(li);
+  });
+  return list;
+};
+
+/** Step 1: search, mark the replaced model, block models already in the chain. */
+const paintWizardModelStep = (body: HTMLElement, editor: AgentEditor, wizard: EditorWizard): void => {
+  const replaced = wizard.mode === 'replace' ? editor.draft.chain[wizard.index] : null;
+  const context = element('p', 'wizard-context');
+  if (replaced) {
+    context.append(document.createTextNode(`${t('wizardReplaces')} `), element('code', '', replaced.model));
+  } else {
+    context.append(document.createTextNode(t('wizardAppends', wizard.index + 1)));
+  }
+  body.append(context);
+
+  const search = document.createElement('input');
+  search.type = 'search';
+  search.className = 'editor-input wizard-search';
+  search.value = wizardFilter;
+  search.placeholder = t('wizardModelSearch');
+  search.autocomplete = 'off';
+  search.spellcheck = false;
+  search.setAttribute('aria-label', t('wizardModelSearch'));
+  body.append(search);
+
+  const list = element('div', 'wizard-models');
+  const fillList = (filterText: string): void => {
+    list.replaceChildren();
+    const filter = filterText.trim().toLowerCase();
+    const items = modelCatalog.filter((entry) => !filter || entry.toLowerCase().includes(filter));
+    if (items.length === 0) {
+      list.append(element('div', 'wizard-empty', modelCatalog.length === 0 ? t('modelCheckLabel') : t('noModelsMatchingFilter')));
+      return;
+    }
+    for (const entry of items) {
+      const blocked = chainContainsModel(editor.draft.chain, entry, wizard.mode === 'replace' ? wizard.index : -1);
+      const isCurrent = replaced !== null && entry === replaced.model;
+      const row = element('button', `wizard-model-row${isCurrent ? ' is-current' : ''}${blocked ? ' is-blocked' : ''}`);
+      row.type = 'button';
+      row.disabled = blocked;
+      row.title = entry;
+      if (isCurrent) row.setAttribute('aria-current', 'true');
+      row.append(element('span', 'wizard-model-name', entry));
+      const tags = element('span', 'wizard-tags');
+      if (isCurrent) tags.append(element('span', 'wizard-tag is-current', t('wizardCurrent')));
+      if (blocked) tags.append(element('span', 'wizard-tag', t('wizardInChain')));
+      if (tags.childElementCount > 0) row.append(tags);
+      row.addEventListener('click', () => {
+        if (!agentEditor?.wizard) return;
+        agentEditor.wizard = wizardChooseModel(agentEditor.wizard, entry);
+        wizardFocusCustom = false;
+        paint();
+      });
+      list.append(row);
+    }
+  };
+  // Filter in place: a full repaint would steal the caret from the field.
+  search.addEventListener('input', () => {
+    wizardFilter = search.value;
+    fillList(search.value);
+  });
+  fillList(wizardFilter);
+  body.append(list);
+};
+
+/** Step 2: "none", the known variants, the previous one, or a custom value. */
+const paintWizardVariantStep = (body: HTMLElement, editor: AgentEditor, wizard: EditorWizard): void => {
+  if (!wizard.model) return;
+  const context = element('p', 'wizard-context');
+  context.append(document.createTextNode(`${t('wizardModelLabel')} `), element('code', '', wizard.model));
+  if (!wizard.lockedModel) {
+    const change = element('button', 'wizard-link', t('wizardChangeModel'));
+    change.type = 'button';
+    change.addEventListener('click', () => {
+      if (!agentEditor?.wizard) return;
+      agentEditor.wizard.step = 'model';
+      wizardScrollPending = true;
+      paint();
+    });
+    context.append(change);
+  }
+  body.append(context);
+
+  const known = variantsForModel(wizard.model);
+  const previous = wizard.mode === 'replace' && wizard.origModel === wizard.model ? wizard.origVariant : null;
+  const options = [...known];
+  // The previous value stays selectable even when the catalog does not list it.
+  if (previous && !options.includes(previous)) options.push(previous);
+
+  const choose = (kind: 'none' | 'pick', value: string | null): void => {
+    if (!agentEditor?.wizard) return;
+    agentEditor.wizard = wizardChooseVariant(agentEditor.wizard, kind, value);
+    wizardFocusCustom = false;
+    paint();
+  };
+
+  const group = element('div', 'wizard-variants');
+  group.setAttribute('role', 'radiogroup');
+  group.setAttribute('aria-label', t('wizardVariantLabel'));
+  const none = element('button', 'wizard-variant-option is-sans', t('wizardNoVariant'));
+  none.type = 'button';
+  none.setAttribute('role', 'radio');
+  none.setAttribute('aria-checked', String(wizard.variantKind === 'none'));
+  none.addEventListener('click', () => choose('none', null));
+  group.append(none);
+  for (const variant of options) {
+    const option = element('button', 'wizard-variant-option', variant);
+    option.type = 'button';
+    option.setAttribute('role', 'radio');
+    option.setAttribute('aria-checked', String(wizard.variantKind === 'pick' && wizard.variant === variant));
+    if (variant === previous) option.append(element('span', 'wizard-bisher', t('wizardPrevious')));
+    option.addEventListener('click', () => choose('pick', variant));
+    group.append(option);
+  }
+  const custom = element('button', 'wizard-variant-option is-sans', t('wizardCustomVariant'));
+  custom.type = 'button';
+  custom.setAttribute('role', 'radio');
+  custom.setAttribute('aria-checked', String(wizard.variantKind === 'custom'));
+  custom.addEventListener('click', () => {
+    if (!agentEditor?.wizard) return;
+    const next = agentEditor.wizard;
+    next.variantKind = 'custom';
+    next.variant = null;
+    wizardFocusCustom = true;
+    paint();
+  });
+  group.append(custom);
+  body.append(group);
+  if (known.length === 0) body.append(element('p', 'wizard-note', t('wizardNoKnownVariants')));
+
+  if (wizard.variantKind === 'custom') {
+    const field = element('div', 'wizard-custom');
+    const label = element('label', 'editor-label', t('wizardCustomLabel'));
+    label.setAttribute('for', 'wizard-custom-variant');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'wizard-custom-variant';
+    input.className = 'editor-input wizard-custom-input';
+    input.value = wizard.customText;
+    input.maxLength = 24;
+    input.placeholder = t('wizardCustomPlaceholder');
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    const error = element('p', 'wizard-error');
+    error.hidden = true;
+    const validate = (): void => {
+      const bad = input.value.trim() !== '' && !isValidVariantName(input.value);
+      input.setAttribute('aria-invalid', String(bad));
+      error.hidden = !bad;
+      error.textContent = bad ? t('wizardVariantInvalid') : '';
+    };
+    // A valid value advances on change/Enter only, so typing never repaints.
+    const commit = (): void => {
+      if (!agentEditor?.wizard) return;
+      const next = wizardCommitCustom(agentEditor.wizard, input.value);
+      if (!next) {
+        input.setAttribute('aria-invalid', 'true');
+        error.hidden = false;
+        error.textContent = t('wizardVariantInvalid');
+        return;
+      }
+      agentEditor.wizard = next;
+      paint();
+    };
+    input.addEventListener('input', () => {
+      if (agentEditor?.wizard) agentEditor.wizard.customText = input.value;
+      validate();
+    });
+    input.addEventListener('change', commit);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        commit();
+      }
+    });
+    field.append(label, input, error);
+    body.append(field);
+  }
+};
+
+/** Step 3: the fixed destination, the changed slot, and the untouched rest. */
+const paintWizardReviewStep = (body: HTMLElement, editor: AgentEditor, wizard: EditorWizard, model: ReadyModel): void => {
+  const entry = wizardEntryOf(wizard);
+  const old = wizard.mode === 'replace' ? editor.draft.chain[wizard.index] : null;
+  const unchanged = wizardIsUnchanged(wizard, editor.draft.chain);
+
+  const target = element('div', 'wizard-target');
+  target.append(element('span', '', t('wizardWritesTo')));
+  const where = editor.target.scope === 'root'
+    ? t('editorScopeRoot')
+    : t('editorScopePreset', editor.presetName);
+  target.append(element('b', '', `${where} · ${editor.target.layer === 'project' ? t('editorLayerProject') : t('editorLayerGlobal')}`));
+  target.append(element('span', 'wizard-path', editorTargetPath(model, editor)));
+  body.append(target);
+
+  const diff = element('div', 'wizard-diff');
+  if (old) {
+    const row = element('div', 'wizard-diff-row is-old');
+    row.append(element('span', 'wizard-diff-label', t('wizardSlotOld', wizard.index + 1)));
+    row.append(element('span', 'wizard-diff-model', old.model));
+    row.append(old.variant
+      ? element('span', 'variant', old.variant)
+      : element('span', 'wizard-variant-none', t('wizardWithout')));
+    diff.append(row);
+  }
+  if (entry) {
+    const row = element('div', 'wizard-diff-row is-new');
+    row.append(element('span', 'wizard-diff-label', wizard.mode === 'replace'
+      ? t('wizardSlotNew', wizard.index + 1)
+      : t('wizardNewSlot', wizard.index + 1)));
+    row.append(element('span', 'wizard-diff-model', entry.model));
+    row.append(entry.variant
+      ? element('span', 'variant', entry.variant)
+      : element('span', 'wizard-variant-none', t('wizardWithout')));
+    diff.append(row);
+  }
+  body.append(diff);
+
+  const rest = editor.draft.chain
+    .map((ref, index) => ({ ref, index }))
+    .filter(({ index }) => !(wizard.mode === 'replace' && index === wizard.index));
+  if (rest.length > 0) {
+    const band = element('div', 'wizard-band');
+    band.append(element('span', 'wizard-band-title', t('wizardRest')));
+    const list = element('ol');
+    for (const { ref, index } of rest) {
+      const item = element('li');
+      item.append(element('span', 'chain-rank', String(index + 1)));
+      item.append(element('span', 'wizard-band-model', ref.model));
+      item.append(ref.variant
+        ? element('span', 'variant', ref.variant)
+        : element('span', 'wizard-variant-none', t('wizardWithout')));
+      list.append(item);
+    }
+    band.append(list);
+    body.append(band);
+  }
+
+  if (unchanged) body.append(element('p', 'wizard-note', t('wizardNoChange', wizard.index + 1)));
+  const footer = element('div', 'wizard-footer');
+  const apply = element('button', 'editor-save wizard-apply', t('wizardApply'));
+  apply.type = 'button';
+  apply.disabled = !entry || unchanged;
+  apply.addEventListener('click', applyAgentWizard);
+  footer.append(apply);
+  body.append(footer);
+  if (!unchanged) body.append(element('p', 'wizard-note', t('wizardReviewHint')));
+};
+
+/** The wizard card that takes the editor's place while a model/variant is chosen. */
+const paintAgentWizard = (panel: HTMLElement, model: ReadyModel): void => {
+  const editor = agentEditor;
+  const wizard = editor?.wizard;
+  if (!editor || !wizard) return;
+  const card = element('div', 'agent-wizard');
+  card.tabIndex = -1;
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-label', `${editor.agent}: ${wizardStepTitle(wizard.step)}`);
+
+  const head = element('div', 'wizard-head');
+  const titles = element('div', 'wizard-titles');
+  titles.append(element('div', 'wizard-kicker', wizard.mode === 'replace'
+    ? t('wizardReplaceKicker', wizard.index + 1)
+    : t('wizardAddKicker', wizard.index + 1)));
+  titles.append(element('div', 'wizard-title', wizardStepTitle(wizard.step)));
+  head.append(titles);
+  const close = element('button', 'icon-btn', '×');
+  close.type = 'button';
+  close.title = t('cancel');
+  close.setAttribute('aria-label', t('cancel'));
+  close.addEventListener('click', () => {
+    if (!agentEditor) return;
+    agentEditor.wizard = null;
+    wizardFilter = '';
+    wizardFocusCustom = false;
+    paint();
+  });
+  head.append(close);
+  card.append(head, wizardSteps(wizard.step));
+
+  const body = element('div', 'wizard-body');
+  if (wizard.step === 'model') paintWizardModelStep(body, editor, wizard);
+  else if (wizard.step === 'variant') paintWizardVariantStep(body, editor, wizard);
+  else paintWizardReviewStep(body, editor, wizard, model);
+  card.append(body);
+  panel.append(card);
+
+  if (wizard.step === 'model') {
+    const current = card.querySelector<HTMLElement>('.wizard-model-row.is-current');
+    if (wizardScrollPending) {
+      wizardScrollPending = false;
+      if (current && !wizardFilter.trim()) {
+        requestAnimationFrame(() => {
+          try { current.scrollIntoView({ block: 'nearest' }); } catch { /* ignore */ }
+        });
+      }
+    }
+    requestAnimationFrame(() => {
+      try { card.querySelector<HTMLInputElement>('.wizard-search')?.focus({ preventScroll: true }); } catch { /* ignore */ }
+    });
+  } else if (wizard.step === 'variant' && wizardFocusCustom) {
+    wizardFocusCustom = false;
+    requestAnimationFrame(() => {
+      try { card.querySelector<HTMLInputElement>('.wizard-custom-input')?.focus({ preventScroll: true }); } catch { /* ignore */ }
+    });
+  }
 };
 
 const relativeTime = (timestamp: number): string => {
@@ -1662,6 +2295,9 @@ const paint = (): void => {
     [...root.querySelectorAll<HTMLElement>('.session-option')].find((item) => item.dataset.session === focusedSession)?.focus();
   }
   ensurePresetEditorPolling();
+  // A repaint disposes the poll handle registered in `mounted`; arm it again
+  // even when the restart notice is temporarily replaced by another screen.
+  scheduleRestartPoll();
   scheduleHeight();
 };
 
@@ -1695,6 +2331,7 @@ const watchSessions = (currentDirectory: string | null): void => {
     const subscription = ++subscriptionToken;
     subscribedProject = projectId;
     agentSessions = new Map();
+    turnStarts = emptyTurnStartTracker();
     openAgent = undefined;
     paint();
     if (!projectId) return;
@@ -1703,7 +2340,9 @@ const watchSessions = (currentDirectory: string | null): void => {
         if (token !== sessionsToken || subscription !== subscriptionToken || subscribedProject !== projectId || snapshot.projectId !== projectId) return;
         const records = snapshot.sessions.filter((session) => session.projectId === projectId);
         lastSessionSnapshot = { records: records as AgentSession[], projectId, directory: currentDirectory, sessionId: currentSessionId };
-        const next = groupAgentSessions(records as AgentSession[], projectId, currentDirectory, Date.now(), finishedWindowHours * 60 * 60 * 1000, currentSessionId);
+        const now = Date.now();
+        turnStarts = trackTurnStarts(turnStarts, records as AgentSession[], now);
+        const next = groupAgentSessions(records as AgentSession[], projectId, currentDirectory, now, finishedWindowHours * 60 * 60 * 1000, currentSessionId);
         // Avoid stealing focus on unchanged host updates.
         const signature = (groups: Map<string, AgentSessionGroups>): string => JSON.stringify([...groups].map(([name, entries]) => [
           name,
@@ -1862,11 +2501,12 @@ const resetEditorDraft = (model: ReadyModel, editor: AgentEditor): void => {
   editor.draft = source
     ? draftFromAgent(source)
     : draftFromAgent({ agent: editor.agent, models: [] });
-  editor.pickerMode = null;
+  editor.wizard = null;
   editor.removeConfirm = false;
-  pickerFilter = '';
-  pickerAppliedFilter = '';
-  if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
+  wizardFilter = '';
+  wizardScrollPending = false;
+  wizardFocusCustom = false;
+  chainFlash = null;
 };
 
 const openAgentEditor = (agent: PresetAgent, model: ReadyModel): void => {
@@ -1881,13 +2521,10 @@ const openAgentEditor = (agent: PresetAgent, model: ReadyModel): void => {
     draft: draftFromAgent(agent),
     chainOpen: true,
     advancedOpen: false,
-    pickerMode: null,
-    pickerIndex: 0,
+    wizard: null,
     removeConfirm: false,
   };
   resetEditorDraft(model, agentEditor);
-  pickerFilter = '';
-  pickerAppliedFilter = '';
   if (modelCatalog.length === 0) void fetchModelCatalog();
   paint();
   setTimeout(() => {
@@ -1897,9 +2534,10 @@ const openAgentEditor = (agent: PresetAgent, model: ReadyModel): void => {
 
 const closeAgentEditor = (): void => {
   agentEditor = null;
-  pickerFilter = '';
-  pickerAppliedFilter = '';
-  if (pickerDebounce) { clearTimeout(pickerDebounce); pickerDebounce = 0; }
+  wizardFilter = '';
+  wizardScrollPending = false;
+  wizardFocusCustom = false;
+  chainFlash = null;
 };
 
 /**
@@ -1969,9 +2607,9 @@ const saveAgentEditor = async (): Promise<void> => {
     await host.writeFile(path, next);
     closeAgentEditor();
     await loadAndPaint();
-    notice = { tone: 'success', title: t('editorSaved', editor.agent), body: path };
+    notice = { tone: 'warning', title: t('editorSaved', editor.agent), body: restartHint(), restart: true };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
   } catch (error) {
     notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
     paint();
@@ -2001,37 +2639,14 @@ const removeAgentFromTarget = async (): Promise<void> => {
     await host.writeFile(path, next);
     closeAgentEditor();
     await loadAndPaint();
-    notice = { tone: 'success', title: t('editorRemoved', editor.agent) };
+    notice = { tone: 'warning', title: t('editorRemoved', editor.agent), body: restartHint(), restart: true };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
   } catch (error) {
     notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
     paint();
     autoDismissNotice(6000);
   }
-};
-
-/** Applies a picked model to the chain, either appending or replacing an entry. */
-const applyEditorPick = (picked: string, variant?: string): void => {
-  const editor = agentEditor;
-  if (!editor) return;
-  const ref: PresetModelRef = variant ? { model: picked, variant } : { model: picked };
-  if (editor.pickerMode === 'add-fallback') {
-    // A chain with the same model twice is pointless; keep the first entry.
-    if (!editor.draft.chain.some((entry) => entry.model === picked)) {
-      editor.draft.chain = [...editor.draft.chain, ref];
-    }
-  } else {
-    const index = Math.min(Math.max(editor.pickerIndex, 0), Math.max(editor.draft.chain.length - 1, 0));
-    const chain = [...editor.draft.chain];
-    if (chain.length === 0) chain.push(ref);
-    else chain[index] = ref;
-    editor.draft.chain = chain;
-  }
-  editor.pickerMode = null;
-  pickerFilter = '';
-  pickerAppliedFilter = '';
-  paint();
 };
 
 const doClone = async (model: ReadyModel): Promise<void> => {
@@ -2052,7 +2667,7 @@ const doClone = async (model: ReadyModel): Promise<void> => {
   if (agents.length === 0 && !visibleParent) {
     notice = { tone: 'error', title: t('presetNotChanged'), body: t('noAgentsConfigured') };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
     return;
   }
   const targetPath = scope === 'global'
@@ -2066,12 +2681,12 @@ const doClone = async (model: ReadyModel): Promise<void> => {
     cloneState = null;
     notice = { tone: 'success', title: t('cloneSuccess', trimmed), body: targetPath };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
     await loadAndPaint();
   } catch (error) {
     notice = { tone: 'error', title: t('presetNotChanged'), body: errorText(error) };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
   }
 };
 
@@ -2137,7 +2752,7 @@ const switchSessionModel = async (sessionId: string, model: string): Promise<voi
     interaction = { kind: 'browse' };
     notice = { tone: 'success', title: t('modelSwitched'), body: `${model}${currentSessionTitle ? ` (${currentSessionTitle})` : ''} — wirksam ab nächstem Turn` };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
     void host.toast({ kind: 'success', message: t('switchFailedToast', model) });
   } catch (error) {
     interaction = { kind: 'browse' };
@@ -2160,12 +2775,12 @@ const clearProjectOverride = async (): Promise<void> => {
     await loadAndPaint();
     notice = { tone: 'success', title: t('overrideCleared'), body: model.project.path };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
     void host.toast({ kind: 'success', message: t('overrideCleared') });
   } catch (error) {
     notice = { tone: 'error', title: t('presetNotChanged'), body: errorText(error) };
     paint();
-    autoDismissNotice(5000);
+    autoDismissNotice(15000);
   }
 };
 
@@ -2253,10 +2868,10 @@ const applyPreset = async (
     const newOrchestratorModel = orchestratorModel(model.view.effective, name);
     interaction = { kind: 'browse' };
     await loadAndPaint();
-    notice = { tone: 'success', title: t('presetSaved', name) };
+    notice = { tone: 'warning', title: t('presetSaved', name), body: restartHint(), restart: true };
     paint();
+    autoDismissNotice(15000);
     void host.toast({ kind: 'success', message: `${t('presetSaved', name)} ${restartHint()}` });
-    autoDismissNotice(5000);
     // Wenn die aktuelle Session der Orchestrator ist: anbieten, dessen Modell umzustellen.
     if (currentSessionAgent === 'orchestrator' && currentSessionId && newOrchestratorModel) {
       interaction = {
@@ -2277,6 +2892,8 @@ const applyPreset = async (
 
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
+  // The agent editor owns Escape while it is open (wizard layer, then editor).
+  if (agentEditor) return;
   if (interaction.kind === 'confirm') {
     interaction = { kind: 'browse' };
     paint();
@@ -2294,8 +2911,16 @@ document.addEventListener('keydown', (event) => {
 document.addEventListener('keydown', (event) => {
   if (!agentEditor) return;
   if (event.key === 'Escape') {
-    closeAgentEditor();
-    paint();
+    if (agentEditor.wizard) {
+      // The wizard is a layer of its own: Escape leaves it without a change.
+      agentEditor.wizard = null;
+      wizardFilter = '';
+      wizardFocusCustom = false;
+      paint();
+    } else {
+      closeAgentEditor();
+      paint();
+    }
     event.preventDefault();
   }
 });
@@ -2309,7 +2934,7 @@ document.addEventListener('click', (event) => {
     settingsOpen = false;
     paint();
   }
-  if (agentEditor && !target.closest('.agent-editor') && !target.closest('.agent-model.is-editable')) {
+  if (agentEditor && !target.closest('.agent-editor') && !target.closest('.agent-wizard') && !target.closest('.agent-model.is-editable')) {
     closeAgentEditor();
     paint();
   }

@@ -7,9 +7,11 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
+import { promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseCatalogOutput } from './model-audit.ts';
+import { managedConfigFromEnviron, managedConfigPath, parseRegistryFile, pickManagedPids, type RegistryCandidate } from './service-restart.ts';
 
 const PORT = Number(process.env.OPENCHAMBER_SERVICE_PORT ?? '0');
 const TOKEN = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
@@ -91,6 +93,104 @@ const send = (res: http.ServerResponse, status: number, body: unknown): void => 
   res.end(payload);
 };
 
+/** OpenChamber keeps one registry file per managed OpenCode process. */
+const REGISTRY_DIR = path.join(homedir(), '.config', 'openchamber', 'managed-opencode');
+/** Reading the whole environment is unnecessary; 256 KiB covers realistic setups. */
+const ENVIRON_LIMIT_BYTES = 256 * 1024;
+
+/**
+ * Reads the registry: one `<pid>.json` per managed process. Unreadable or
+ * corrupt files are skipped instead of failing the whole restart.
+ */
+const readRegistryEntries = async (): Promise<RegistryCandidate[]> => {
+  let names: string[];
+  try {
+    names = await fsp.readdir(REGISTRY_DIR);
+  } catch {
+    return [];
+  }
+  const entries: RegistryCandidate[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const content = await fsp.readFile(path.join(REGISTRY_DIR, name), 'utf8');
+      const entry = parseRegistryFile(name, content);
+      if (entry) entries.push(entry);
+    } catch {
+      // Process vanished or file is corrupt; that candidate simply drops out.
+    }
+  }
+  return entries;
+};
+
+/**
+ * The process environment, but only for a live process of this uid. The
+ * managed flag lives in OPENCODE_CONFIG (not argv), so this is the identity
+ * check that keeps a same-named external service from being killed.
+ */
+const readManagedEnviron = async (pid: number): Promise<string | null> => {
+  const base = `/proc/${pid}`;
+  try {
+    const info = await fsp.stat(base);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (uid !== null && info.uid !== uid) return null;
+    const handle = await fsp.open(path.join(base, 'environ'), 'r');
+    try {
+      const buffer = Buffer.alloc(ENVIRON_LIMIT_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, ENVIRON_LIMIT_BYTES, 0);
+      return buffer.subarray(0, bytesRead).toString('utf8');
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * SIGTERM the managed OpenCode process; OpenChamber's health check restarts it.
+ * No match is success: the process may already be restarting.
+ */
+const restartManagedOpenCode = async (res: http.ServerResponse): Promise<void> => {
+  let managedPath = await managedConfigPath(process.env.OPENCODE_CONFIG, fsp.realpath);
+  const entries = await readRegistryEntries();
+  const environs = new Map<number, string | null>();
+  for (const entry of entries) environs.set(entry.pid, await readManagedEnviron(entry.pid));
+  // The host does not forward OPENCODE_CONFIG to contributed services on every
+  // installation. The registry entry's own environ still proves the process is
+  // managed; the strict run/instances/<id> pattern remains the gate.
+  if (!managedPath) {
+    for (const environ of environs.values()) {
+      const candidate = managedConfigFromEnviron(environ);
+      if (!candidate) continue;
+      managedPath = await managedConfigPath(candidate, fsp.realpath);
+      if (managedPath) break;
+    }
+  }
+  if (!managedPath) {
+    send(res, 409, { ok: false, error: 'external' });
+    return;
+  }
+  const pids = pickManagedPids(entries, managedPath, (pid) => environs.get(pid));
+  const killed: number[] = [];
+  try {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGTERM');
+        killed.push(pid);
+      } catch (error) {
+        // The process already exited between the check and the signal.
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') continue;
+        throw error;
+      }
+    }
+  } catch (error) {
+    send(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  send(res, 200, { ok: true, killed });
+};
+
 const server = http.createServer(async (req, res) => {
   if (req.method !== 'GET' && req.method !== 'POST') {
     send(res, 405, { ok: false, error: 'method-not-allowed' });
@@ -111,6 +211,10 @@ const server = http.createServer(async (req, res) => {
       const force = url.searchParams.get('refresh') === 'true';
       const { catalog, checkedAt, variants } = await getCatalog(force);
       send(res, 200, { ok: true, catalog, checkedAt, variants, source: 'opencode models' });
+      return;
+    }
+    if (url.pathname === '/restart-opencode' && req.method === 'POST') {
+      await restartManagedOpenCode(res);
       return;
     }
     if (url.pathname === '/switch-model' && req.method === 'POST') {

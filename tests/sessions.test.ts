@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { ACTIVE_STALE_MS, buildSessionTree, groupActiveSessions, sameDirectory, type AgentSession } from '../src/sessions.ts';
+import { ACTIVE_STALE_MS, buildSessionTree, emptyTurnStartTracker, groupActiveSessions, sameDirectory, trackTurnStarts, type AgentSession } from '../src/sessions.ts';
 
 /** Test base time; relative timestamps keep the staleness cases exact. */
 const NOW = Date.now();
@@ -79,6 +79,62 @@ test('a session crosses from active to recent when its grace expires', () => {
 });
 
 const current = { id: 'root', title: 'Aktuell', busy: false, agent: 'fixer', model: 'model/id' };
+
+test('turn anchors are unknown on the first snapshot, because the turn predates observation', () => {
+  const tracker = trackTurnStarts(emptyTurnStartTracker(), [session({ activity: 'running' })], NOW);
+  assert.equal(tracker.observed, true);
+  assert.equal(tracker.starts.get('s1'), null);
+  // A later running snapshot must not invent a start for that same turn.
+  const later = trackTurnStarts(
+    tracker, [session({ activity: 'running', updatedAt: NOW + 10_000 })], NOW + 10_000,
+  );
+  assert.equal(later.starts.get('s1'), null);
+});
+
+test('a turn that starts between snapshots gets an anchor that survives while it runs', () => {
+  let tracker = trackTurnStarts(emptyTurnStartTracker(), [session({ activity: 'unknown' })], NOW);
+  assert.equal(tracker.starts.size, 0);
+  const startedAt = NOW + 5_000;
+  tracker = trackTurnStarts(tracker, [session({ activity: 'running', updatedAt: startedAt })], startedAt);
+  assert.equal(tracker.starts.get('s1'), startedAt);
+  // Retrying belongs to the same busy state and keeps the anchor.
+  tracker = trackTurnStarts(
+    tracker, [session({ activity: 'retrying', updatedAt: startedAt + 3_000 })], startedAt + 3_000,
+  );
+  assert.equal(tracker.starts.get('s1'), startedAt);
+});
+
+test('a pause or result drops the anchor; the next turn anchors anew', () => {
+  const startedAt = NOW + 5_000;
+  let tracker = trackTurnStarts(emptyTurnStartTracker(), [], NOW);
+  tracker = trackTurnStarts(tracker, [session({ activity: 'running', updatedAt: startedAt })], startedAt);
+  assert.equal(tracker.starts.get('s1'), startedAt);
+  const waiting = trackTurnStarts(
+    tracker, [session({ activity: 'waiting-permission', updatedAt: startedAt + 2_000 })], startedAt + 2_000,
+  );
+  assert.equal(waiting.starts.has('s1'), false);
+  const restartedAt = startedAt + 9_000;
+  const restarted = trackTurnStarts(
+    waiting, [session({ activity: 'running', updatedAt: restartedAt })], restartedAt,
+  );
+  assert.equal(restarted.starts.get('s1'), restartedAt);
+});
+
+test('finished, stale and vanished sessions hold no turn anchor', () => {
+  let tracker = trackTurnStarts(emptyTurnStartTracker(), [], NOW);
+  tracker = trackTurnStarts(tracker, [session({ activity: 'running' })], NOW);
+  assert.equal(tracker.starts.size, 1);
+  const stale = trackTurnStarts(
+    tracker, [session({ activity: 'running', updatedAt: NOW - ACTIVE_STALE_MS.running - 1 })], NOW,
+  );
+  assert.equal(stale.starts.size, 0);
+  const finished = trackTurnStarts(
+    tracker, [session({ activity: 'idle', outcome: 'completed', updatedAt: NOW })], NOW,
+  );
+  assert.equal(finished.starts.size, 0);
+  const gone = trackTurnStarts(tracker, [], NOW);
+  assert.equal(gone.starts.size, 0);
+});
 
 test('builds a tree rooted at the current session, including nested descendants', () => {
   const tree = buildSessionTree(current, [

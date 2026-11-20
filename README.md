@@ -1,7 +1,7 @@
 # oMo Slim Preset Selector
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![version](https://img.shields.io/badge/version-1.7.0)](package.json)
+[![version](https://img.shields.io/badge/version-1.8.0)](package.json)
 
 An OpenChamber extension that shows the active **oh-my-opencode-slim** preset and switches it — without the TUI and without editing the config by hand.
 
@@ -17,7 +17,7 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 - **Source editor in the side panel**: the pencil next to the active preset (in the Work Status section and in the panel) opens the rail panel with the raw JSONC of the file that defines the active preset — the project override when it defines it, otherwise the global config. Saves are validated first: invalid JSONC, a non-object root or a missing/broken `presets` map is refused and nothing is written. `Ctrl/Cmd+S` and the Save button go through the same gate; the validation pill shows the position of the first error.
 - Checks configured models against the effective model catalog and marks missing ones in red.
 - Tracks active and recently finished sessions per agent, with live runtime display.
-- Effective after a Managed Service restart (Settings → Apply & Restart).
+- Changes to presets and agent definitions take effect for new sessions only after the Managed Service restarts: the saved banner offers **Restart OpenCode**, which asks for confirmation (all running sessions end), stops the managed OpenCode via the contributed service and waits for the model catalog to come back. It works in the web and desktop clients; when OpenCode runs outside OpenChamber, the banner points to a manual restart and falls back to the Settings link.
 
 ## Install
 
