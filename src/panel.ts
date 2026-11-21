@@ -1012,6 +1012,8 @@ const chainVariantControl = (ref: PresetModelRef, index: number): HTMLElement =>
     wizardFilter = '';
     wizardFocusCustom = false;
     paint();
+    // A panel can outlive changes to the provider catalog, even after saving the model.
+    if (!modelVariants[ref.model]?.length) void fetchModelCatalog({ refresh: true });
   });
   return button;
 };
@@ -1497,25 +1499,28 @@ const paintWizardVariantStep = (body: HTMLElement, editor: AgentEditor, wizard: 
   const group = element('div', 'wizard-variants');
   group.setAttribute('role', 'radiogroup');
   group.setAttribute('aria-label', t('wizardVariantLabel'));
-  const none = element('button', 'wizard-variant-option is-sans', t('wizardNoVariant'));
+  const none = element('button', 'wizard-variant-option is-sans');
   none.type = 'button';
   none.setAttribute('role', 'radio');
   none.setAttribute('aria-checked', String(wizard.variantKind === 'none'));
+  none.append(element('span', 'wizard-variant-name', t('wizardNoVariant')));
   none.addEventListener('click', () => choose('none', null));
   group.append(none);
   for (const variant of options) {
-    const option = element('button', 'wizard-variant-option', variant);
+    const option = element('button', 'wizard-variant-option');
     option.type = 'button';
     option.setAttribute('role', 'radio');
     option.setAttribute('aria-checked', String(wizard.variantKind === 'pick' && wizard.variant === variant));
+    option.append(element('span', 'wizard-variant-name', variant));
     if (variant === previous) option.append(element('span', 'wizard-bisher', t('wizardPrevious')));
     option.addEventListener('click', () => choose('pick', variant));
     group.append(option);
   }
-  const custom = element('button', 'wizard-variant-option is-sans', t('wizardCustomVariant'));
+  const custom = element('button', 'wizard-variant-option is-sans');
   custom.type = 'button';
   custom.setAttribute('role', 'radio');
   custom.setAttribute('aria-checked', String(wizard.variantKind === 'custom'));
+  custom.append(element('span', 'wizard-variant-name', t('wizardCustomVariant')));
   custom.addEventListener('click', () => {
     if (!agentEditor?.wizard) return;
     const next = agentEditor.wizard;
@@ -2443,9 +2448,9 @@ const refreshModelCheck = (refs: readonly string[], options: { background?: bool
     });
 };
 
-const fetchModelCatalog = async (): Promise<void> => {
+const fetchModelCatalog = async ({ refresh = false } = {}): Promise<void> => {
   try {
-    const result = await host.serviceRequest({ method: 'GET', path: '/models' });
+    const result = await host.serviceRequest({ method: 'GET', path: refresh ? '/models?refresh=true' : '/models' });
     if (result.status !== 200) return;
     const answer = JSON.parse(result.body) as { ok?: boolean; catalog?: unknown };
     if (answer.ok && Array.isArray(answer.catalog)) {

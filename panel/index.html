@@ -897,20 +897,56 @@
       }
       .wizard-tag.is-current { color: var(--oc-success, #a6e3a1); border-color: color-mix(in srgb, var(--oc-success, #a6e3a1) 50%, transparent); }
       .wizard-empty { padding: 12px 8px; text-align: center; font-size: 10.5px; color: var(--oc-muted, #999); }
-      .wizard-variants { display: flex; flex-wrap: wrap; gap: 5px; }
-      .wizard-variant-option {
-        padding: 3px 9px;
+      .wizard-variants {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 3px;
+        width: 100%;
+        max-height: 220px;
+        min-height: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+        padding: 4px;
         border: 1px solid var(--oc-border, rgba(127, 127, 127, 0.28));
-        border-radius: 999px;
-        background: transparent;
+        border-radius: 7px;
+        background: var(--oc-elevated, rgba(127, 127, 127, 0.06));
+      }
+      .wizard-variant-option {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        flex: 0 0 auto;
+        width: 100%;
+        min-width: 0;
+        min-height: 30px;
+        padding: 5px 8px;
+        border: 1px solid color-mix(in srgb, var(--oc-border, rgba(127, 127, 127, 0.28)) 82%, transparent);
+        border-radius: 5px;
+        background: var(--oc-card, rgba(127, 127, 127, 0.04));
         color: var(--oc-fg, #ddd);
         font: 10.5px/1.4 var(--oc-mono, ui-monospace, monospace);
+        text-align: left;
         cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease;
       }
+      .wizard-variant-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
       .wizard-variant-option.is-sans { font-family: inherit; font-size: 11px; }
-      .wizard-variant-option:hover { border-color: var(--oc-fg, #ddd); }
-      .wizard-variant-option[aria-checked="true"] { background: var(--oc-primary, #4a9eff); border-color: var(--oc-primary, #4a9eff); color: var(--oc-primary-foreground, #fff); }
-      .wizard-bisher { margin-left: 4px; font-family: inherit; font-size: 8px; font-weight: 600; line-height: 1; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.85; }
+      .wizard-variant-option:hover { border-color: var(--oc-primary, #4a9eff); background: var(--oc-hover, rgba(127, 127, 127, 0.15)); }
+      .wizard-variant-option[aria-checked="true"] {
+        background: var(--oc-primary, #4a9eff);
+        border-color: var(--oc-primary, #4a9eff);
+        color: var(--oc-primary-foreground, #fff);
+      }
+      .wizard-variant-option[aria-checked="true"]::after {
+        content: "✓";
+        flex: none;
+        margin-left: 4px;
+        font: 600 11px/1 var(--oc-font, system-ui, sans-serif);
+      }
+      .wizard-bisher { flex: none; margin-left: auto; font-family: inherit; font-size: 8px; font-weight: 600; line-height: 1; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.85; }
       .wizard-variant-option:not([aria-checked="true"]) .wizard-bisher { color: var(--oc-muted, #999); }
       .wizard-custom { display: flex; flex-direction: column; gap: 3px; }
       .wizard-error { margin: 0; font-size: 10px; color: var(--oc-destructive, #f38ba8); }
@@ -1153,6 +1189,8 @@
       .status-surface .model-picker.editor-picker { max-height: 200px; }
       .status-surface .agent-wizard { gap: 6px; padding: 6px 8px; }
       .status-surface .wizard-models { max-height: 200px; }
+      .status-surface .wizard-variants { max-height: 148px; }
+      .status-surface .wizard-variant-option { min-height: 28px; padding: 4px 7px; }
       .status-surface .editor-advanced { gap: 8px; }
 
       /* SDK banner: text full width, restart CTA on a row below; the × sits
