@@ -36,17 +36,10 @@ await build({
   logLevel: 'info',
 });
 
-// Single source of truth for the version: package.json. Keep the cache-buster
-// in panel/index.html in sync so the PWA/relay never serves a stale bundle.
-const indexPath = 'panel/index.html';
-let html = readFileSync(indexPath, 'utf8');
-html = html.replace(/main\.js\?v=[0-9A-Za-z._-]+/, `main.js?v=${version}`);
-writeFileSync(indexPath, html);
-
-// Keep the README version badge in sync too.
+// Keep the README version badge in sync with the package.
 const readmePath = 'README.md';
 let readme = readFileSync(readmePath, 'utf8');
 readme = readme.replace(/version-[0-9A-Za-z._-]+/, `version-${version}`);
 writeFileSync(readmePath, readme);
 
-console.log(`Version ${version} injected into panel/index.html and README.md.`);
+console.log(`Version ${version} injected into README.md.`);

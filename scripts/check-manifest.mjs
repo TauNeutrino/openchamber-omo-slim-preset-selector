@@ -6,7 +6,7 @@ import { parseManifestJson } from '@openchamber/sdk/schemas';
 const text = await readFile('package.json', 'utf8');
 const result = parseManifestJson(text);
 if (!result.ok) {
-  throw new Error(`package.json manifest is invalid: ${result.code} ${result.error}`);
+  throw new Error(`package.json manifest is invalid: ${result.code} ${result.message}`);
 }
 
 const manifest = result.manifest;
@@ -38,11 +38,13 @@ if (scriptSources.length === 0) {
   throw new Error('The panel HTML references no script.');
 }
 for (const source of scriptSources) {
-  const bare = source.split('?')[0].split('#')[0];
-  if (bare.includes('..') || bare.startsWith('/')) {
+  if (/[?#]/.test(source)) {
+    throw new Error(`Script ${source} must name a built file without a query or fragment.`);
+  }
+  if (source.includes('..') || source.startsWith('/')) {
     throw new Error(`Script ${source} must stay inside the package.`);
   }
-  const scriptPath = resolve(dirname(panel.entry), bare);
+  const scriptPath = resolve(dirname(panel.entry), source);
   const info = await stat(scriptPath);
   if (!info.isFile() || info.size === 0) {
     throw new Error(`Built script ${scriptPath} is missing or empty. Run npm run build.`);
