@@ -29,6 +29,13 @@ import {
   type PresetView,
 } from './config.ts';
 import {
+  orchestratorTarget,
+  supportsLiveReload,
+  targetLabel,
+  type OpenCodeInfo,
+  type SessionTarget,
+} from './opencode-mode.ts';
+import {
   chainContainsModel,
   draftFromAgent,
   isValidVariantName,
@@ -449,9 +456,7 @@ const savePresetEditor = async (): Promise<void> => {
     await host.writeFile(editor.path, editor.content);
     editor.original = editor.content;
     await loadAndPaint();
-    notice = { tone: 'warning', title: t('presetEditorSaved', editor.presetName), body: restartHint(), restart: true };
-    paint();
-    autoDismissNotice(15000);
+    await announceSaved(t('presetEditorSaved', editor.presetName), editor.presetName === activePresetName());
     requestAnimationFrame(() => root.querySelector<HTMLElement>('.edit-preset-btn')?.focus());
   } catch (error) {
     if (screen.kind !== 'editor') return;
@@ -2612,9 +2617,7 @@ const saveAgentEditor = async (): Promise<void> => {
     await host.writeFile(path, next);
     closeAgentEditor();
     await loadAndPaint();
-    notice = { tone: 'warning', title: t('editorSaved', editor.agent), body: restartHint(), restart: true };
-    paint();
-    autoDismissNotice(15000);
+    await announceSaved(t('editorSaved', editor.agent), editor.agent === 'orchestrator');
   } catch (error) {
     notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
     paint();
@@ -2644,9 +2647,7 @@ const removeAgentFromTarget = async (): Promise<void> => {
     await host.writeFile(path, next);
     closeAgentEditor();
     await loadAndPaint();
-    notice = { tone: 'warning', title: t('editorRemoved', editor.agent), body: restartHint(), restart: true };
-    paint();
-    autoDismissNotice(15000);
+    await announceSaved(t('editorRemoved', editor.agent), editor.agent === 'orchestrator');
   } catch (error) {
     notice = { tone: 'error', title: t('editorNotSaved'), body: errorText(error) };
     paint();
@@ -2737,6 +2738,105 @@ const loadAndPaint = async (): Promise<void> => {
   };
   paint();
   refreshModelCheck(auditRefsFor(resolved.view));
+};
+
+/** OpenCode host facts from the service; null until a check found a version. */
+let openCodeInfo: OpenCodeInfo | null = null;
+let openCodeInfoLoad: Promise<OpenCodeInfo | null> | null = null;
+
+const ensureOpenCodeInfo = (): Promise<OpenCodeInfo | null> => {
+  if (openCodeInfo) return Promise.resolve(openCodeInfo);
+  openCodeInfoLoad ??= (async () => {
+    try {
+      const result = await host.serviceRequest({ method: 'GET', path: '/opencode-info' });
+      if (result.status !== 200) return null;
+      const answer = JSON.parse(result.body) as Partial<OpenCodeInfo> & { ok?: boolean };
+      if (!answer.ok || typeof answer.major !== 'number') return null;
+      openCodeInfo = { version: answer.version ?? null, major: answer.major, server: answer.server ?? 'unknown' };
+      return openCodeInfo;
+    } catch {
+      return null;
+    } finally {
+      openCodeInfoLoad = null;
+    }
+  })();
+  return openCodeInfoLoad;
+};
+
+const activePresetName = (): string | null => (screen.kind === 'ready' ? screen.model.view.active.name : null);
+
+const activeOrchestratorTarget = (): SessionTarget | null => {
+  const name = activePresetName();
+  if (screen.kind !== 'ready' || !name) return null;
+  return orchestratorTarget(screen.model.view.effective[name]);
+};
+
+const serviceJson = async (method: 'GET' | 'POST', path: string, body?: unknown): Promise<Record<string, unknown>> => {
+  const result = await host.serviceRequest({ method, path, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  let answer: Record<string, unknown> = {};
+  try {
+    answer = JSON.parse(result.body) as Record<string, unknown>;
+  } catch { /* non-JSON answer: reported by status below */ }
+  if (result.status !== 200 || answer.ok !== true) {
+    throw new Error(typeof answer.error === 'string' ? answer.error : `HTTP ${result.status}`);
+  }
+  return answer;
+};
+
+/**
+ * Tells the user a config write landed. OpenCode v1, or a host whose version
+ * could not be read, keeps the restart notice. On v2 nothing is asked:
+ * subagents follow the file live, and when the orchestrator may have changed
+ * the config is reloaded and the open session moves onto the orchestrator
+ * agent with the preset's model and effort, which is what the model picker shows.
+ */
+const announceSaved = async (title: string, orchestratorChanged: boolean): Promise<void> => {
+  const info = await ensureOpenCodeInfo();
+  if (!supportsLiveReload(info)) {
+    notice = { tone: 'warning', title, body: restartHint(), restart: true };
+    paint();
+    autoDismissNotice(15000);
+    return;
+  }
+  if (!orchestratorChanged) {
+    notice = { tone: 'success', title, body: t('liveApplied') };
+    paint();
+    autoDismissNotice(8000);
+    return;
+  }
+  notice = { tone: 'info', title, body: t('reloadingConfig') };
+  paint();
+  const lines: string[] = [t('liveApplied')];
+  let tone: Notice['tone'] = 'success';
+  try {
+    const answer = await serviceJson('POST', '/reload-config');
+    lines.push(answer.reloaded === true ? t('configReloaded') : t('reloadManagedNote'));
+  } catch (error) {
+    tone = 'warning';
+    lines.push(t('reloadFailed', errorText(error)));
+  }
+  const target = activeOrchestratorTarget();
+  const sessionId = currentSessionId;
+  if (target && sessionId) {
+    try {
+      await serviceJson('POST', '/switch-session', {
+        sessionId,
+        agent: target.agent,
+        model: `${target.providerID}/${target.id}`,
+        variant: target.variant ?? '',
+      });
+      currentSessionAgent = target.agent;
+      lines.push(t('sessionSwitched', targetLabel(target)));
+    } catch (error) {
+      tone = 'warning';
+      lines.push(t('sessionSwitchFailed', errorText(error)));
+    }
+  } else if (target) {
+    lines.push(t('noSessionToSwitch'));
+  }
+  notice = { tone, title, body: lines.join(' ') };
+  paint();
+  autoDismissNotice(15000);
 };
 
 const switchSessionModel = async (sessionId: string, model: string): Promise<void> => {
@@ -2873,6 +2973,11 @@ const applyPreset = async (
     const newOrchestratorModel = orchestratorModel(model.view.effective, name);
     interaction = { kind: 'browse' };
     await loadAndPaint();
+    if (supportsLiveReload(await ensureOpenCodeInfo())) {
+      void host.toast({ kind: 'success', message: t('presetSaved', name) });
+      await announceSaved(t('presetSaved', name), true);
+      return;
+    }
     notice = { tone: 'warning', title: t('presetSaved', name), body: restartHint(), restart: true };
     paint();
     autoDismissNotice(15000);
