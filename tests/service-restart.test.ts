@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -9,14 +10,14 @@ import {
   type RegistryCandidate,
 } from '../src/service-restart.ts';
 
-const HOME = '/home/tester';
-const MANAGED = `${HOME}/.config/openchamber/run/instances/42/opencode.managed.json`;
+const HOME = path.resolve('/home/tester');
+const MANAGED = path.join(HOME, '.config/openchamber/run/instances/42/opencode.managed.json');
 
 test('only OPENCODE_CONFIG under run/instances/<id> counts as managed', async () => {
   assert.equal(await managedConfigPath(MANAGED, async (value) => value, HOME), MANAGED);
   assert.equal(
     await managedConfigPath('~/.config/openchamber/run/instances/7/opencode.managed.json', async (value) => value, HOME),
-    `${HOME}/.config/openchamber/run/instances/7/opencode.managed.json`,
+    path.join(HOME, '.config/openchamber/run/instances/7/opencode.managed.json'),
   );
   assert.equal(await managedConfigPath(`${HOME}/.config/opencode/oh-my-opencode-slim.json`, async (value) => value, HOME), null);
   assert.equal(await managedConfigPath('/tmp/opencode.managed.json', async (value) => value, HOME), null);

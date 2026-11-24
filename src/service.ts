@@ -7,7 +7,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { promises as fsp } from 'node:fs';
+import { existsSync, promises as fsp } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { parseCatalogOutput } from './model-audit.ts';
@@ -22,11 +22,21 @@ if (!TOKEN) throw new Error('OPENCHAMBER_SERVICE_TOKEN missing');
 const CACHE_MS = 60_000;
 /** The CLI reaches its background service; give it time, but not forever. */
 const CLI_TIMEOUT_MS = 20_000;
-/** Exec candidates, in order: PATH first, then the well-known install path. */
-const CLI_CANDIDATES = (): string[] => ([
-  'opencode',
-  path.join(homedir(), '.opencode', 'bin', 'opencode'),
-]);
+const CLI_CANDIDATES = (): string[] => {
+  const windows = process.platform === 'win32';
+  const candidates = ['opencode', path.join(homedir(), '.opencode', 'bin', windows ? 'opencode.exe' : 'opencode')];
+  if (!windows) return candidates;
+
+  // npm puts a .cmd shim on PATH. execFile needs the native executable behind it.
+  const npmPrefixes = (process.env.PATH ?? '').split(path.delimiter).filter((dir) => path.isAbsolute(dir));
+  const roaming = process.env.APPDATA ?? path.join(homedir(), 'AppData', 'Roaming');
+  npmPrefixes.push(path.join(roaming, 'npm'));
+  for (const prefix of new Set(npmPrefixes)) {
+    const executable = path.join(prefix, 'node_modules', '@opencode', 'cli', 'bin', 'opencode.exe');
+    if (existsSync(executable)) candidates.push(executable);
+  }
+  return candidates;
+};
 
 type Cache = { catalog: string[]; checkedAt: string; variants: Record<string, string[]>; error?: undefined } | null;
 let cache: Cache = null;
