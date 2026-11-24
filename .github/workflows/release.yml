@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer version to release, without a leading v (for example 2.0.0 or 2.0.0-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+
+          if ! printf '%s\n' "$VERSION" | grep -Eq "$semver_re"; then
+            echo "::error::version must be MAJOR.MINOR.PATCH with an optional prerelease (for example 2.0.0 or 2.0.0-rc.1), without a leading v; got '$VERSION'"
+            exit 1
+          fi
+
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "$package_version" ]; then
+            echo "::error::version input '$VERSION' does not match package.json version '$package_version'"
+            exit 1
+          fi
+
+      - name: Ensure the tag does not already exist
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          existing="$(git ls-remote --tags origin "refs/tags/v${VERSION}")"
+          if [ -n "$existing" ]; then
+            echo "::error::tag v${VERSION} already exists; bump the version before releasing"
+            exit 1
+          fi
+
+      - run: npm run check
+      - run: npm run type-check
+      - name: No drift in generated or version-synced files
+        run: git diff --exit-code -- panel/main.js service/main.js README.md
+
+      - name: Create and push annotated tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "refs/tags/v${VERSION}"
+
+      - name: Create GitHub release
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          args=(--generate-notes --title "v${VERSION}")
+          case "$VERSION" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          gh release create "v${VERSION}" "${args[@]}"

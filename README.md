@@ -2,6 +2,8 @@
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![version](https://img.shields.io/badge/version-1.9.0)](package.json)
+[![CI](https://github.com/TauNeutrino/openchamber-omo-slim-preset-selector/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TauNeutrino/openchamber-omo-slim-preset-selector/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/TauNeutrino/openchamber-omo-slim-preset-selector)](https://github.com/TauNeutrino/openchamber-omo-slim-preset-selector/releases)
 
 An OpenChamber extension that shows the active **oh-my-opencode-slim** preset and switches it — without the TUI and without editing the config by hand.
 
@@ -12,7 +14,7 @@ An OpenChamber extension that shows the active **oh-my-opencode-slim** preset an
 - **Switches explicitly per scope**: apply a preset globally, or only for the open project — with the file that will be written shown before you confirm.
 - Dropdown of every preset, with the orchestrator model as a decision hint.
 - Confirmation dialog before every switch; cancelling writes nothing.
-- Writes **only** the `preset` key. Comments, ordering and formatting of the JSONC file stay intact.
+- **Preset switching writes only the `preset` key**; the agent and source editors below write only their selected agent block or the validated document. Targeted edits keep comments, ordering and formatting of the JSONC file intact.
 - Per-agent editor behind the preset-editing setting: ordered fallback chain with a variant per entry, `inheritModelFrom`, temperature, skills/skills_add/skills_remove, MCPs, permission, display name and color — written to the preset or to the root `agents` map, in either layer.
 - **Source editor in the side panel**: the pencil next to the active preset (in the Work Status section and in the panel) opens the rail panel with the raw JSONC of the file that defines the active preset — the project override when it defines it, otherwise the global config. Saves are validated first: invalid JSONC, a non-object root or a missing/broken `presets` map is refused and nothing is written. `Ctrl/Cmd+S` and the Save button go through the same gate; the validation pill shows the position of the first error.
 - Checks configured models against the effective model catalog and marks missing ones in red.
@@ -32,7 +34,7 @@ Requires OpenChamber 2.3.3 or later.
    - `service` (`exec: opencode`) for the model catalog check
 4. Open the **oMo Slim Preset Selector** panel on the right rail.
 
-Web and desktop clients are supported. The phone app and VS Code do not load extensions.
+OpenChamber extensions load in the web and desktop clients and in the mobile app. This extension does not opt in to `panel.mobile`, so the rail panel is available on web and desktop only, while its Work Status section also appears in the mobile app. VS Code does not load OpenChamber extensions.
 
 ## Where the config comes from
 
@@ -79,31 +81,48 @@ Active sessions show a blue circled count badge; sessions that finished within t
 
 ## Build
 
+Requires Node.js 22 and npm.
+
 ```bash
-npm install
+npm ci
 npm run build   # writes panel/main.js and service/main.js
-npm run check   # build + iife + manifest + tests
+npm run check   # build + IIFE check + manifest check + tests
 npm test
 npm run type-check
 ```
 
-The built files are committed: OpenChamber installs extensions without building them. Bump `version` in `package.json` to ship an update through Git.
+The built files are committed: OpenChamber installs the extension as-is and never builds it. After a source change, rebuild and commit `panel/main.js` and `service/main.js`; CI fails when the committed bundles differ from a fresh build.
 
-## Deploy
+## Release and update
+
+`version` in `package.json` is the single version source, and the host's update check is driven by it. Versions follow SemVer: patch for fixes, minor for backward-compatible features, major for breaking changes; release candidates use a `-rc.N` suffix.
+
+To release:
 
 1. Bump `version` in `package.json`.
-2. Run `npm run check` (build + IIFE check + manifest check + tests).
-3. Commit everything, including the regenerated `panel/main.js`, `panel/index.html` and `service/main.js`.
-4. Push to `origin/main`.
-5. On the target machine, update the installed copy and rebuild if needed:
+2. Run the full checks locally:
    ```bash
-   cd ~/.config/openchamber/extensions/omo-preset
-   git pull
-   npm run build   # only if node_modules are present; otherwise the committed bundle is used
+   npm ci
+   npm run check
+   npm run type-check
    ```
-6. Reload OpenChamber (or the panel) so the new bundle is served.
+3. Commit `package.json` together with the regenerated `panel/main.js` and `service/main.js`, open a PR and merge it to `main` after CI and review.
+4. From `main`, run the release workflow:
+   ```bash
+   gh workflow run release.yml -f version=1.9.1
+   ```
+   The workflow validates that the input matches `package.json`, that the tag does not exist, and that the checks pass. It then creates the annotated tag `vX.Y.Z` and a GitHub Release with generated notes (marked prerelease for `-rc.N`). The tag is created by the workflow — do not tag by hand. GitHub Releases are the changelog; there is no `CHANGELOG.md`. See [CONTRIBUTING.md](CONTRIBUTING.md#maintainer-release-runbook) for the maintainer checklist.
 
-The installed extension is a plain Git clone of this repository, so `git pull` is enough to bring in a released update.
+### Updating an installed extension
+
+Git-URL installs update from **Settings → Extensions**: OpenChamber checks at most once an hour, and **Check for updates** starts a check immediately. An update keeps the granted permissions and the extension's saved settings; a newly added permission must be approved again. Folder and zip installs do not update themselves — replace the folder or reinstall the zip, then reload OpenChamber.
+
+Append a ref to the Git URL to pin it: `...git#v1.9.0` for a tag or `...git#main` for a branch.
+
+### Rollback and uninstall
+
+To roll back, reinstall from the previous release tag (`...git#v1.8.0`, for example) or point the install at a development folder checkout, then reload OpenChamber. Removing a URL or zip install deletes the installed copy and the extension's host storage; a folder install only forgets the path. This extension stores `presetEditingEnabled`, `finishedWindowHours` and a transient editor-request key there, so removing and re-adding resets them. The JSONC config files the extension edited are never deleted.
+
 ## Permissions
 
 | Permission | Why |
@@ -113,7 +132,7 @@ The installed extension is a plain Git clone of this repository, so `git pull` i
 | `sessions` | Track sub-sessions per agent |
 | `service` (`exec: opencode`) | Run `opencode models` for the catalog check |
 
-The extension only ever writes the `preset` key. The presets map, comments, ordering and formatting of the JSONC file are preserved.
+Switching writes only the `preset` key. The agent editor writes the selected agent block, and the source editor saves the document you edited after validation. Targeted edits preserve comments, ordering and formatting of the JSONC file.
 
 ## License
 
@@ -121,10 +140,10 @@ MIT
 
 ## Support
 
+Found a bug or have a question? Open an issue: [github.com/TauNeutrino/openchamber-omo-slim-preset-selector/issues](https://github.com/TauNeutrino/openchamber-omo-slim-preset-selector/issues). Report security problems privately as described in [SECURITY.md](SECURITY.md).
+
 If you find this extension useful, you can support the development:
 
 [![Donate with PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_SM.gif)](https://www.paypal.com/donate/?hosted_button_id=R5G9H9TFGQNUY)
 
 [![ko-fi](https://storage.ko-fi.com/cdn/kofi5.png?v=6)](https://ko-fi.com/O4O01ZCNJE)
-EOF
-echo written

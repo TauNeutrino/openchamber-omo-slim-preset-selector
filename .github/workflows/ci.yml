@@ -22,9 +22,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
-      - run: npm run build
-      - name: Manifest check
-        run: node scripts/check-manifest.mjs
-      - name: Bundle matches a fresh build
-        run: git diff --exit-code -- panel/main.js README.md
+      - run: npm run check
+      - run: npm run type-check
+      - name: No drift in generated or version-synced files
+        run: git diff --exit-code -- panel/main.js service/main.js README.md
